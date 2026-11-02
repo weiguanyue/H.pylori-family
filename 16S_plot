@@ -1,0 +1,2127 @@
+#基于属水平做口腔bray-curtis距离的计算
+library(vegan)
+library(ape)
+library(phyloseq)
+library(tidyverse)
+library(readxl)
+library(ggpubr)
+library(RColorBrewer)
+library(ggsignif)
+
+# ==========================================
+# 步骤 0：【核心修正】在计算 Beta 多样性前，先严格对齐样本 (1664个)
+# ==========================================
+oral.16s.abun.1 <- oral.16s.abun.genus
+rownames(oral.16s.abun.1) <- oral.16s.abun.1$Taxa
+oral.16s.abun.1 <- oral.16s.abun.1[, -1] # 移除 Taxa 列，只留样本列
+
+# 1. 获取 Metadata 与 丰度表 共同存在的 1664 个样本 ID
+common_samples <- intersect(colnames(oral.16s.abun.1), oral.16s.meta$ID2)
+
+# 2. 筛选丰度表和 Metadata，只保留这 1664 个样本
+oral.16s.abun.filtered <- oral.16s.abun.1[, common_samples]
+oral.16s.meta_clean   <- oral.16s.meta %>% filter(ID2 %in% common_samples)
+
+
+# ==========================================
+# 步骤 1：基于对齐后的 1664 个样本计算 Beta 多样性
+# ==========================================
+b.diversity <- function(count) {
+  count <- as.data.frame(count)
+  count <- as.data.frame(t(count)) # 转换成列为物种，行为样本
+  dis.mat <- list()
+  dis.mat[["bray"]] <- as.data.frame(as.matrix(vegdist(count, method = "bray")))
+  dis.mat[["euclidean"]] <- as.data.frame(as.matrix(vegdist(count, method = "euclidean")))
+  dis.mat[["jaccard"]] <- as.data.frame(as.matrix(vegdist(count, method = "jaccard", binary = TRUE)))
+  return(dis.mat)
+}
+
+# 使用过滤后的丰度表计算
+oral.16s.beta <- b.diversity(oral.16s.abun.filtered)
+
+# ==========================================
+# 步骤 2：整理 Bray-Curtis 距离矩阵并匹配亲属关系
+# ==========================================
+oral.16s.beta.long <- oral.16s.beta[["bray"]]
+oral.16s.beta.long$Sample1 <- rownames(oral.16s.beta.long)
+oral.16s.beta.long <- pivot_longer(oral.16s.beta.long, cols = -Sample1, names_to = "Sample2", values_to = "Distance")
+
+# 1. 剔除自身配对，并进行无方向全局去重 (解决双向重复计数问题)
+oral.16s.beta.long <- oral.16s.beta.long %>% 
+  filter(Sample1 != Sample2) %>%
+  mutate(pair_id = paste(pmin(Sample1, Sample2), pmax(Sample1, Sample2), sep = "___")) %>%
+  distinct(pair_id, .keep_all = TRUE)
+
+# 2. 合并家庭 ID，区分组间/组内家庭 (使用 select 避免多重 left_join 列名冲突)
+oral.16s.beta.long <- oral.16s.beta.long %>%
+  left_join(oral.16s.meta_clean %>% select(ID2, Family1 = Family), by = c("Sample1" = "ID2")) %>%
+  left_join(oral.16s.meta_clean %>% select(ID2, Family2 = Family), by = c("Sample2" = "ID2")) %>%
+  mutate(Family = ifelse(Family1 == Family2, "Within", "Between"))
+
+# 3. 提取组间 (Between-family)
+oral.16s.between <- oral.16s.beta.long %>%
+  filter(Family == "Between") %>%
+  mutate(Group = "Between-family") %>%
+  select(Distance, Group)
+
+# 4. 家庭内部配对：提取并判定亲属关系类型
+oral.16s.within <- oral.16s.beta.long %>% filter(Family == "Within")
+
+# 读取亲属配对关系对照表
+membership <- read_xlsx("Input/Membership.xlsx")
+membership$Group1[is.na(membership$Group1)] <- "Other"
+membership$Group2[is.na(membership$Group2)] <- "Other"
+
+membership_all <- bind_rows(
+  membership %>% select(Membership1, Membership2, Group1) %>% rename(M1 = Membership1, M2 = Membership2, Group = Group1),
+  membership %>% select(Membership2, Membership1, Group2) %>% rename(M1 = Membership2, M2 = Membership1, Group = Group2)
+) %>% distinct(M1, M2, .keep_all = TRUE)
+
+# 匹配亲属分组 (使用 oral.16s.meta_clean)
+oral.16s.within <- oral.16s.within %>%
+  left_join(oral.16s.meta_clean %>% select(ID2, M1 = Membership), by = c("Sample1" = "ID2")) %>%
+  left_join(oral.16s.meta_clean %>% select(ID2, M2 = Membership), by = c("Sample2" = "ID2")) %>%
+  left_join(membership_all, by = c("M1", "M2")) %>%
+  mutate(Group = case_when(
+    Group == "Spouse" ~ "Spouse",
+    Group == "Mother_offspring" ~ "Mother-offspring",
+    Group == "Father_offspring" ~ "Father-offspring",
+    Group == "Sibling" ~ "Sibling",
+    Group == "Grandparent_grandchild" ~ "Grandparent-grandchild",
+    TRUE ~ NA_character_
+  )) %>%
+  filter(!is.na(Group)) %>%
+  select(Distance, Group)
+
+# 5. 合并绘图数据
+plot_df_oral <- bind_rows(oral.16s.between, oral.16s.within)
+
+# 固定分组顺序
+group_levels <- c("Between-family", "Within-family", "Spouse", "Mother-offspring", "Father-offspring", "Sibling", "Grandparent-grandchild")
+
+within_all_oral <- plot_df_oral %>% filter(Group != "Between-family") %>% mutate(Group = "Within-family")
+plot_df_oral <- bind_rows(plot_df_oral, within_all_oral) %>%
+  mutate(Group = factor(Group, levels = group_levels))
+
+# 6. 统计样本量并生成 X 轴标签
+group_n_oral <- plot_df_oral %>% count(Group) %>% mutate(label = paste0(Group, "\n(n=", n, ")"))
+label_map_oral <- set_names(group_n_oral$label, group_n_oral$Group)
+
+# ==========================================
+# 步骤 3：定义比较组合与绘图
+# ==========================================
+comp_list <- list(
+  # 1. 组间vs组内
+  c("Between-family", "Within-family"),
+  # 2~11：后面5类亲属全部两两对比
+  c("Spouse", "Mother-offspring"),
+  c("Spouse", "Father-offspring"),
+  c("Spouse", "Sibling"),
+  c("Spouse", "Grandparent-grandchild"),
+  c("Mother-offspring", "Father-offspring"),
+  c("Mother-offspring", "Sibling"),
+  c("Mother-offspring", "Grandparent-grandchild"),
+  c("Father-offspring", "Sibling"),
+  c("Father-offspring", "Grandparent-grandchild"),
+  c("Sibling", "Grandparent-grandchild"))
+comp_list <- list(
+    # 1. 组间vs组内
+    c("Between-family", "Within-family"),
+    c("Spouse", "Mother-offspring"),
+    c("Spouse", "Father-offspring"),
+    c("Spouse", "Grandparent-grandchild"),
+    c("Mother-offspring", "Grandparent-grandchild"),
+    c("Sibling", "Grandparent-grandchild"))
+
+ggplot(plot_df_oral, aes(x = Group, y = Distance, fill = Group)) +
+    geom_violin(width = 0.7, alpha = 0.6, linewidth = 0.3) +
+    geom_boxplot(width = 0.3, outlier.size = 1, linewidth = 0.3) +
+    geom_signif(comparisons = comp_list,
+        test = "wilcox.test",
+        map_signif_level = TRUE,
+        step_increase = 0.1,
+        textsize = 3
+    ) + scale_fill_brewer(palette = "Set3") +
+    scale_x_discrete(labels = label_map_oral) +
+    labs(y = "Bray-Curtis distance",
+        x = NULL
+    ) +theme_bw() +
+    theme( panel.grid = element_blank(),
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 10, color = "black"),
+        axis.text.y = element_text(size = 10, color = "black"),
+        legend.position = "none")
+
+ggsave("p_beta_oral-2.pdf", width = 7, height = 8)
+
+col_two <- c("Underage" = "#A2D9B1", "Grown-up" = "#C7B7E5")
+
+# ==========================================
+# 1. 筛选口腔家庭内部配对并匹配数据
+# ==========================================
+# 使用口腔的 oral.16s.beta.long 和 oral.16s.meta_clean (或 oral.16s.meta)
+within_pair_oral <- oral.16s.beta.long %>% filter(Family == "Within")
+
+within_pair_oral <- within_pair_oral %>%
+  left_join(oral.16s.meta_clean[, c("ID2", "Membership", "Age2")], by = c("Sample1" = "ID2")) %>%
+  rename(M1 = Membership, Age1 = Age2) %>%
+  left_join(oral.16s.meta_clean[, c("ID2", "Membership", "Age2")], by = c("Sample2" = "ID2")) %>%
+  rename(M2 = Membership, Age2 = Age2)
+
+# 读取亲属配对对照表（Membership.xlsx）
+membership <- read_xlsx("Input/Membership.xlsx")
+membership$Group1[is.na(membership$Group1)] <- "Other"
+membership$Group2[is.na(membership$Group2)] <- "Other"
+
+mem_all <- bind_rows(
+  membership %>% select(Membership1, Membership2, Group1) %>% rename(m1 = Membership1, m2 = Membership2, PairType = Group1),
+  membership %>% select(Membership2, Membership1, Group2) %>% rename(m1 = Membership2, m2 = Membership1, PairType = Group2)
+) %>% distinct(m1, m2, .keep_all = TRUE)
+
+# 标注配对类型：保留 Mother_offspring, Father_offspring, Sibling 三类
+within_pair_oral <- within_pair_oral %>%
+  left_join(mem_all, by = c("M1" = "m1", "M2" = "m2")) %>%
+  filter(PairType %in% c("Mother_offspring", "Father_offspring", "Sibling"))
+
+# ==========================================
+# 步骤 2：判断口腔每一组配对的年龄层级
+# ==========================================
+get_pair_age_group <- function(pair_type, m1_typ, m2_typ, a1, a2) {
+  if (pair_type %in% c("Mother_offspring", "Father_offspring")) {
+    child_age <- if (m1_typ %in% c("m", "f")) a2 else a1
+    return(if (child_age == "children") "Underage" else "Grown-up")
+  }
+  
+  if (pair_type == "Sibling") {
+    if (a1 == "children" & a2 == "children") {
+      return("Underage")
+    } else if (a1 == "adult" & a2 == "adult") {
+      return("Grown-up")
+    } else {
+      return(NA_character_)
+    }
+  }
+  
+  return(NA_character_)
+}
+
+# 清洗与数据分组
+within_pair_clean_oral <- within_pair_oral %>%
+  rowwise() %>%
+  mutate(
+    Age_Group = get_pair_age_group(PairType, M1, M2, Age1, Age2)
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(Age_Group)) %>%
+  mutate(
+    Age_Group = factor(Age_Group, levels = c("Underage", "Grown-up"))
+  )
+
+# 拆分为 3 个独立子集
+mom_off_data_oral <- within_pair_clean_oral %>% filter(PairType == "Mother_offspring")
+dad_off_data_oral <- within_pair_clean_oral %>% filter(PairType == "Father_offspring")
+sibling_data_oral  <- within_pair_clean_oral %>% filter(PairType == "Sibling")
+
+# 1. 绘图：Mother-offspring (Oral)
+ggplot(mom_off_data_oral, aes(x = Age_Group, y = Distance, fill = Age_Group)) +
+  geom_violin(width = 0.7, alpha = 1, linewidth = 0.3) +
+  geom_boxplot(width = 0.3, outlier.size = 1, linewidth = 0.3) +
+  geom_signif(
+    comparisons = list(c("Underage", "Grown-up")),
+    test = "wilcox.test",
+    map_signif_level = TRUE,
+    step_increase = 0.1,
+    textsize = 3.5
+  ) +
+  scale_fill_manual(values = col_two) +
+  labs(title = "Mother-offspring", y = "Bray-Curtis distance", x = NULL) +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10, color = "black"),
+    axis.text.y = element_text(size = 10, color = "black"),
+    legend.position = "none"
+  )
+ggsave("mother_beta_oral.pdf", width = 4, height = 5)
+
+# 2. 绘图：Father-offspring (Oral)
+ggplot(dad_off_data_oral, aes(x = Age_Group, y = Distance, fill = Age_Group)) +
+  geom_violin(width = 0.7, alpha = 1, linewidth = 0.3) +
+  geom_boxplot(width = 0.3, outlier.size = 1, linewidth = 0.3) +
+  geom_signif(
+    comparisons = list(c("Underage", "Grown-up")),
+    test = "wilcox.test",
+    map_signif_level = TRUE,
+    step_increase = 0.1,
+    textsize = 3.5
+  ) +
+  scale_fill_manual(values = col_two) +
+  labs(title = "Father-offspring", y = "Bray-Curtis distance", x = NULL) +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10, color = "black"),
+    axis.text.y = element_text(size = 10, color = "black"),
+    legend.position = "none"
+  )
+ggsave("father_beta_oral.pdf", width = 4, height = 5)
+
+# 3. 绘图：Sibling (Oral)
+ggplot(sibling_data_oral, aes(x = Age_Group, y = Distance, fill = Age_Group)) +
+  geom_violin(width = 0.7, alpha = 1, linewidth = 0.3) +
+  geom_boxplot(width = 0.3, outlier.size = 1, linewidth = 0.3) +
+  geom_signif(
+    comparisons = list(c("Underage", "Grown-up")),
+    test = "wilcox.test",
+    map_signif_level = TRUE,
+    step_increase = 0.1,
+    textsize = 3.5
+  ) +
+  scale_fill_manual(values = col_two) +
+  labs(title = "Sibling", y = "Bray-Curtis distance", x = NULL) +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10, color = "black"),
+    axis.text.y = element_text(size = 10, color = "black"),
+    legend.position = "none"
+  )
+ggsave("sibling_beta_oral.pdf", width = 4, height = 5)
+
+
+#基于属水平算肠道的
+gut.16s.abun.1 <- gut.16s.abun.genus
+View(gut.16s.abun.1)
+rownames(gut.16s.abun.1) <- gut.16s.abun.1$Taxa
+gut.16s.abun.1 <- gut.16s.abun.1[,-1]
+b.diversity <- function(count) {     
+     library(vegan)
+     library(ape)
+     library(phyloseq)     
+     count <- as.data.frame(count)
+     # rownames(count) <- count[, 1]
+     # count <- count[, -1]
+     count <- as.data.frame(t(count)) # 需要转换成 列为物种，行为样本
+  dis.mat <- list()
+     dis.mat[["bray"]] <- as.data.frame(as.matrix(vegdist(count, method = "bray")))
+     dis.mat[["euclidean"]] <- as.data.frame(as.matrix(vegdist(count, method = "euclidean")))
+     dis.mat[["jaccard"]] <- as.data.frame(as.matrix(vegdist(count, method = "jaccard", binary = TRUE)))
+     return(dis.mat)
+ }
+gut.16s.beta <- b.diversity(gut.16s.abun.1)
+
+library(tidyverse)
+library(readxl)
+library(ggpubr)
+library(RColorBrewer)
+
+# 沿用全局配色预设
+family.color <- brewer.pal(10, "Set3")
+names(family.color) <- c("Between", "Within", "Father_offspring", "Mother_offspring", 
+                         "Spouse", "Sibling", "Grandparent_grandchild", "Nephew", "Roommate", "Other")
+
+# ======================
+# 1. 提取、整理 Bray-Curtis 距离数据
+# ======================
+gut.16s.beta.long <- gut.16s.beta[["bray"]]
+gut.16s.beta.long$Sample1 <- rownames(gut.16s.beta.long)
+gut.16s.beta.long <- pivot_longer(gut.16s.beta.long, cols = -Sample1, names_to = "Sample2", values_to = "Distance")
+
+# 1. 剔除自身配对，并进行无方向全局去重 (彻底解决 A-B 与 B-A 重复计数问题)
+gut.16s.beta.long <- gut.16s.beta.long %>% 
+  filter(Sample1 != Sample2) %>%
+  mutate(pair_id = paste(pmin(Sample1, Sample2), pmax(Sample1, Sample2), sep = "___")) %>%
+  distinct(pair_id, .keep_all = TRUE)
+
+# 2. 合并家庭 ID，区分组间/组内家庭 (使用 select 避免多重 left_join 列名冲突)
+gut.16s.beta.long <- gut.16s.beta.long %>%
+  left_join(gut.16s.meta %>% select(ID2, Family1 = Family), by = c("Sample1" = "ID2")) %>%
+  left_join(gut.16s.meta %>% select(ID2, Family2 = Family), by = c("Sample2" = "ID2")) %>%
+  mutate(Family = ifelse(Family1 == Family2, "Within", "Between"))
+
+# 3. 提取组间 (Between-family)
+gut.16s.between <- gut.16s.beta.long %>%
+  filter(Family == "Between") %>%
+  mutate(Group = "Between-family") %>%
+  select(Distance, Group)
+
+# 4. 家庭内部配对：判定亲属关系类型
+gut.16s.within <- gut.16s.beta.long %>% filter(Family == "Within")
+
+# 读取亲属配对关系对照表
+membership <- read_xlsx("Input/Membership.xlsx")
+membership$Group1[is.na(membership$Group1)] <- "Other"
+membership$Group2[is.na(membership$Group2)] <- "Other"
+
+# 双向配对去重
+membership_all <- bind_rows(
+  membership %>% select(Membership1, Membership2, Group1) %>% rename(M1=Membership1, M2=Membership2, Group=Group1),
+  membership %>% select(Membership2, Membership1, Group2) %>% rename(M1=Membership2, M2=Membership1, Group=Group2)
+) %>% distinct(M1, M2, .keep_all = TRUE)
+
+# 匹配每一对样本的亲属分组
+gut.16s.within <- gut.16s.within %>%
+  left_join(gut.16s.meta %>% select(ID2, M1 = Membership), by = c("Sample1" = "ID2")) %>%
+  left_join(gut.16s.meta %>% select(ID2, M2 = Membership), by = c("Sample2" = "ID2")) %>%
+  left_join(membership_all, by = c("M1", "M2")) %>%
+  # 统一分组命名，和原图完全对应
+  mutate(Group = case_when(
+    Group == "Spouse" ~ "Spouse",
+    Group == "Mother_offspring" ~ "Mother-offspring",
+    Group == "Father_offspring" ~ "Father-offspring",
+    Group == "Sibling" ~ "Sibling",
+    Group == "Grandparent_grandchild" ~ "Grandparent-grandchild",
+    TRUE ~ NA_character_
+  )) %>%
+  filter(!is.na(Group)) %>%
+  select(Distance, Group)
+
+# 5. 合并所有绘图数据
+plot_df <- bind_rows(gut.16s.between, gut.16s.within)
+
+# 固定 X 轴分组顺序
+group_levels <- c("Between-family", "Within-family", "Spouse", "Mother-offspring", "Father-offspring", "Sibling", "Grandparent-grandchild")
+
+# 新增 Within-family 整体汇总组
+within_all <- plot_df %>% filter(Group != "Between-family") %>% mutate(Group = "Within-family")
+plot_df <- bind_rows(plot_df, within_all) %>%
+  mutate(Group = factor(Group, levels = group_levels))
+
+# 6. 统计每组样本量，用于 X 轴标签展示
+group_n <- plot_df %>% count(Group) %>% mutate(label = paste0(Group, "\n(n=", n, ")"))
+label_map <- set_names(group_n$label, group_n$Group)
+
+# ======================
+# 2. 定义两两比较组合（和原图显著性横线完全匹配）先看全部的
+# ======================
+comp_list <- list(
+  # 1. 组间vs组内
+  c("Between-family", "Within-family"),
+  # 2~11：后面5类亲属全部两两对比
+  c("Spouse", "Mother-offspring"),
+  c("Spouse", "Father-offspring"),
+  c("Spouse", "Sibling"),
+  c("Spouse", "Grandparent-grandchild"),
+  c("Mother-offspring", "Father-offspring"),
+  c("Mother-offspring", "Sibling"),
+  c("Mother-offspring", "Grandparent-grandchild"),
+  c("Father-offspring", "Sibling"),
+  c("Father-offspring", "Grandparent-grandchild"),
+  c("Sibling", "Grandparent-grandchild"))
+
+comp_list <- list(c("Between-family", "Within-family"),
+    c("Spouse", "Sibling"),
+    c("Mother-offspring", "Father-offspring"),
+    c("Mother-offspring", "Grandparent-grandchild"),
+    c("Father-offspring", "Sibling"),
+    c("Sibling", "Grandparent-grandchild"))
+
+# ======================
+# 3. 绘图：小提琴+箱线图 期刊标准版
+# ======================
+ggplot(plot_df, aes(x = Group, y = Distance, fill = Group)) +
+    # 小提琴轮廓
+    geom_violin(width = 0.7, alpha = 0.6, linewidth = 0.3) + #scale = "width"保持宽度一致width = 0.8,scale = "area"
+    # 内嵌窄箱线
+    geom_boxplot(width =0.3, outlier.size = 1, linewidth = 0.3) +
+    # 显著性标记
+    geom_signif(comparisons = comp_list,
+                test = "wilcox.test",
+                map_signif_level = TRUE,
+                step_increase = 0.1,
+                textsize = 3
+    ) +
+    # 配色映射
+    scale_fill_brewer(palette = "Set3") +
+    # 坐标轴、标签美化
+    scale_x_discrete(labels = label_map) +
+    labs( y = "Bray-Curtis distance",x = NULL
+    ) +theme_bw() +theme( panel.grid = element_blank(),
+                          axis.text.x = element_text(angle =45, hjust = 1, size =10,color="black"),
+                          axis.text.y = element_text(size = 10,color="black"),
+                          legend.position = "none")
+ggsave("p_beta_gut-2.pdf",width =7, height = 8)
+
+#接下来是bray-curtis距离母子和同胞
+col_two <- c("#88c999", "#b39ddb") # 绿色：未成年，紫色：成年，和你原图配色一致
+
+#严格按照双方均小于18岁才算未成年同胞组的定义，逻辑应修改为：
+#Underage（未成年同胞组）：双方必须都是未成年（a1 == "children" & a2 == "children"）。
+#Grown-up（成年同胞组）：双方必须都是成年人（a1 == "adult" & a2 == "adult"）。
+#混杂对（1个成年 + 1个未成年）：这种情况不属于纯粹的未成年对或成年对，在分析这两组差异时应该过滤掉（剔除），避免引入噪声。
+
+# ==========================================
+# 1. 筛选家庭内部配对
+within_pair <- gut.16s.beta.long %>% filter(Family == "Within")
+
+# 2. 匹配两个样本各自的 Membership (亲属身份) + Age2 (年龄层级: adult/children)
+within_pair <- within_pair %>%
+  left_join(gut.16s.meta[, c("ID2", "Membership", "Age2")], by = c("Sample1" = "ID2")) %>%
+  rename(M1 = Membership, Age1 = Age2) %>%
+  left_join(gut.16s.meta[, c("ID2", "Membership", "Age2")], by = c("Sample2" = "ID2")) %>%
+  rename(M2 = Membership, Age2 = Age2)
+
+# 3. 读取亲属配对对照表（Membership.xlsx）
+membership <- read_xlsx("Input/Membership.xlsx")
+membership$Group1[is.na(membership$Group1)] <- "Other"
+membership$Group2[is.na(membership$Group2)] <- "Other"
+
+# 双向配对合并，确保匹配任意顺序
+mem_all <- bind_rows(
+  membership %>% select(Membership1, Membership2, Group1) %>% rename(m1 = Membership1, m2 = Membership2, PairType = Group1),
+  membership %>% select(Membership2, Membership1, Group2) %>% rename(m1 = Membership2, m2 = Membership1, PairType = Group2)
+) %>% distinct(m1, m2, .keep_all = TRUE)
+
+# 4. 标注配对类型：保留 Mother_offspring, Father_offspring, Sibling 三类
+within_pair <- within_pair %>%
+  left_join(mem_all, by = c("M1" = "m1", "M2" = "m2")) %>%
+  filter(PairType %in% c("Mother_offspring", "Father_offspring", "Sibling"))
+
+# ==========================================
+# 步骤 2：判断每一组配对的「子代/同胞年龄层级」
+# ==========================================
+get_pair_age_group <- function(pair_type, m1_typ, m2_typ, a1, a2) {
+  # A. Mother-offspring / Father-offspring：一方为父母，取子女方的年龄
+  if (pair_type %in% c("Mother_offspring", "Father_offspring")) {
+    # 假设 m 为 Mother，f 为 Father，非 m/f 的那一方即为子女
+    child_age <- if (m1_typ %in% c("m", "f")) a2 else a1
+    return(if (child_age == "children") "Underage" else "Grown-up")
+  }
+  
+  # B. Sibling：严格判定双方年龄
+  if (pair_type == "Sibling") {
+    if (a1 == "children" & a2 == "children") {
+      return("Underage")  # 双方均未成年
+    } else if (a1 == "adult" & a2 == "adult") {
+      return("Grown-up")  # 双方均成年
+    } else {
+      return(NA_character_) # 一成一幼（剔除混杂组）
+    }
+  }
+  
+  return(NA_character_)
+}
+
+# 应用判定逻辑并剔除无效/混杂数据
+within_pair_clean <- within_pair %>%
+  rowwise() %>%
+  mutate(
+    Age_Group = get_pair_age_group(PairType, M1, M2, Age1, Age2)
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(Age_Group)) %>%
+  mutate(
+    Age_Group = factor(Age_Group, levels = c("Underage", "Grown-up"))
+  )
+
+# 拆分为 3 个独立的子集
+mom_off_data  <- within_pair_clean %>% filter(PairType == "Mother_offspring")
+dad_off_data  <- within_pair_clean %>% filter(PairType == "Father_offspring")
+sibling_data  <- within_pair_clean %>% filter(PairType == "Sibling")
+
+
+# ==========================================
+# 步骤 3：定义通用的高颜值小提琴绘图函数
+# ==========================================
+# 配色：第一张图风格（马卡龙鲜绿 + 柔和紫）
+
+col_two <- c("Underage" = "#A2D9B1", "Grown-up" = "#C7B7E5")
+ggplot(mom_off_data, aes(x = Age_Group, y = Distance, fill = Age_Group)) +
+    geom_violin(width = 0.6, alpha = 1, linewidth = 0.3) +
+    geom_boxplot(width = 0.25, outlier.size = 1, linewidth = 0.3) +
+    geom_signif(
+        comparisons = list(c("Underage", "Grown-up")),
+        test = "wilcox.test",
+        map_signif_level = TRUE,
+        step_increase = 0.1,
+        textsize = 3.5
+    ) +
+    scale_fill_manual(values = col_two) +
+    labs(title = "Mother-offspring", y = "Bray-Curtis distance", x = NULL) +
+    theme_bw() +
+    theme(
+        panel.grid = element_blank(),
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 10, color = "black"),
+        axis.text.y = element_text(size = 10, color = "black"),
+        legend.position = "none")
+ggsave("mother_beta_gut.pdf",width =3, height =6)
+
+# 绘图：Father-offspring
+ggplot(dad_off_data, aes(x = Age_Group, y = Distance, fill = Age_Group)) +
+    geom_violin(width = 0.6, alpha =1, linewidth = 0.3) +
+    geom_boxplot(width = 0.25, outlier.size = 1, linewidth = 0.3) +
+    geom_signif(
+        comparisons = list(c("Underage", "Grown-up")),
+        test = "wilcox.test",
+        map_signif_level = TRUE,
+        step_increase = 0.1,
+        textsize = 3.5
+    ) +
+    scale_fill_manual(values = col_two) +
+    labs(title = "Father-offspring", y = "Bray-Curtis distance", x = NULL) +
+    theme_bw() +
+    theme(
+        panel.grid = element_blank(),
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 10, color = "black"),
+        axis.text.y = element_text(size = 10, color = "black"),
+        legend.position = "none" )
+
+# 保存图片
+ggsave("father_beta_gut.pdf", width =3, height = 6)
+
+# 绘图：Sibling
+ggplot(sibling_data, aes(x = Age_Group, y = Distance, fill = Age_Group)) +
+    geom_violin(width = 0.6, alpha = 1, linewidth = 0.3) +
+    geom_boxplot(width = 0.25, outlier.size = 1, linewidth = 0.3) +
+    geom_signif(
+        comparisons = list(c("Underage", "Grown-up")),
+        test = "wilcox.test",
+        map_signif_level = TRUE,
+        step_increase = 0.1,
+        textsize = 3.5
+    ) +
+    scale_fill_manual(values = col_two) +
+    labs(title = "Sibling", y = "Bray-Curtis distance", x = NULL) +
+    theme_bw() +theme(panel.grid = element_blank(),
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 10, color = "black"),
+        axis.text.y = element_text(size = 10, color = "black"),
+        legend.position = "none")
+# 保存图片
+ggsave("sibling_beta_gut.pdf", width = 3, height =6)
+
+#整合成一张图
+plot_data <- within_pair_clean %>%
+    mutate(PairType = factor(PairType,
+            levels = c("Mother_offspring", "Father_offspring", "Sibling"),
+            labels = c("Mother–offspring", "Father–offspring", "Sibling")),
+        Age_Group = factor(Age_Group,levels = c("Underage", "Grown-up")))
+
+# 配色：马卡龙柔和绿 (#A2D9B1) + 柔和紫 (#C7B7E5)
+col_two <- c("Underage" = "#A2D9B1", "Grown-up" = "#C7B7E5")
+
+# 2. 绘制分面小提琴图
+p_merged_bray <- ggplot(plot_data, aes(x = Age_Group, y = Distance, fill = Age_Group)) +
+    # 小提琴图：轻微透明度，极细边框
+    geom_violin(width = 0.75, scale = "width", alpha = 0.85, linewidth = 0.25, color = "black") +
+    # 箱线图：嵌入小提琴内部，隐藏异常值点避免杂乱
+    geom_boxplot(width = 0.2, color = "black", alpha = 0.9, linewidth = 0.3, outlier.shape = NA) +
+    # 分面按 PairType 横向一排
+    facet_wrap(~ PairType, nrow = 1) +
+    # 分面下跨组添加显著性横线（ggsignif 支持分面自动计算）
+    geom_signif(comparisons = list(c("Underage", "Grown-up")),
+        test = "wilcox.test",
+        map_signif_level = TRUE, # 自动转为 *, **, ***
+        step_increase = 0.05,
+        textsize = 3.5,
+        linewidth = 0.3,
+        tip_length = 0.02
+    ) +scale_fill_manual(values = col_two) +
+    # Y轴留出上边距，防止显著性横线被切掉
+    scale_y_continuous(limits = c(0.15, 1.15),
+        breaks = seq(0.2, 1.0, by = 0.2),
+        expand = c(0, 0)
+    ) +labs(x = NULL, y = "Bray–Curtis distance") +
+    theme_bw() +theme( panel.grid = element_blank(),
+        legend.position = "none",
+        # 顶部分面框样式：淡灰色背景 + 粗体字
+        strip.background = element_rect(fill = "#F2F2F2", color = "black", linewidth = 0.3),
+        strip.text = element_text(size = 12, face = "bold", color = "black"),
+        # 坐标轴文本
+        axis.text.x = element_text(angle =45, hjust = 1, size = 12, color = "black"),
+        axis.text.y = element_text(size =12, color = "black"),
+        axis.title.y = element_text(size = 10.5, face = "plain"),
+        # 子图间距
+        panel.spacing = unit(0.8, "lines"))
+ggsave("Merged_Bray_Distance-gut-8-11.pdf", p_merged_bray, width =6, height = 6)
+ggsave("Merged_Bray_Distance-gut-8-11-1.pdf", p_merged_bray, width =6, height =5.5)
+
+
+#接下来算ASV，删除仅出现在 1 个样本里的 ASV（singleton），只保留在≥2 个样本检出的 ASV，
+# 加载所需包
+library(tidyverse)
+library(tidyverse)
+library(readxl)
+library(ggpubr)
+library(RColorBrewer)
+
+# 读取原始肠道GUT-ASV丰度表
+asv_raw <- read.delim("Input/Feces_16S_dada2_asv_table.tsv", sep = "\t", row.names = 1, check.names = FALSE)
+stopifnot(all(vapply(asv_raw, is.numeric, logical(1))))
+
+# 过滤：单个样本中 count >= 2 才视为检出；且该 ASV 必须在至少 2 个样本中可信检出
+asv_bin_all <- t(as.matrix(asv_raw)) >= 2
+keep_asv    <- colSums(asv_bin_all) >= 2
+asv_clean   <- asv_raw[keep_asv, , drop = FALSE]
+
+cat("原始 ASV 数：", nrow(asv_raw), " | 过滤后 ASV 数：", nrow(asv_clean), "\n")
+
+# 保存过滤后的 ASV 表
+write.table(asv_clean, file = "Output/gut_ASV_filter_counts_min2reads_min2samples.txt", sep = "\t", quote = FALSE, col.names = NA)
+
+# 1. 构建最终二值矩阵 (count >= 2 视为检出)
+# =========================================================
+asv_bin      <- t(as.matrix(asv_clean)) >= 2
+sample_vec   <- rownames(asv_bin)
+total_sample <- nrow(asv_bin)
+
+cat("样本数：", total_sample, " | ASV数：", ncol(asv_bin), "\n")
+cat("理论配对数：", choose(total_sample, 2), "\n")
+
+# 1. 各样本 Richness
+richness_vec <- rowSums(asv_bin)
+
+# =========================================================
+# 2. 分块矩阵乘法计算两两 Shared ASV (底层 BLAS 极速版)
+# =========================================================
+shared_mat <- matrix(0, nrow = total_sample, ncol = total_sample, 
+                     dimnames = list(sample_vec, sample_vec))
+
+block_size <- 500L
+start_vec  <- seq.int(from = 1L, to = ncol(asv_bin), by = block_size)
+
+for (start_col in start_vec) {
+  end_col <- min(start_col + block_size - 1L, ncol(asv_bin))
+  
+  # 提取小块并转为双精度浮点数，用于矩阵乘法
+  block <- asv_bin[, start_col:end_col, drop = FALSE]
+  storage.mode(block) <- "double"
+  
+  # 矩阵乘法累加交集: Block %*% t(Block)
+  shared_mat <- shared_mat + tcrossprod(block)
+  
+  rm(block)
+  gc(FALSE)
+}
+
+# =========================================================
+# 3. 提取上三角矩阵并计算 Union 与 Jaccard 共享率
+# =========================================================
+pair_idx      <- which(upper.tri(shared_mat), arr.ind = TRUE)
+shared_vec    <- shared_mat[pair_idx]
+richness1_vec <- richness_vec[pair_idx[, 1]]
+richness2_vec <- richness_vec[pair_idx[, 2]]
+
+# 容斥原理算并集: Union = A + B - Intersect
+union_vec     <- richness1_vec + richness2_vec - shared_vec
+
+# 构建最终结果表
+share_df <- tibble(
+  Sample1        = sample_vec[pair_idx[, 1]],
+  Sample2        = sample_vec[pair_idx[, 2]],
+  Richness1      = as.integer(richness1_vec),
+  Richness2      = as.integer(richness2_vec),
+  Shared_ASV     = as.integer(shared_vec),
+  Union_ASV      = as.integer(union_vec),
+  ASV_share_rate = ifelse(union_vec == 0, NA_real_, (shared_vec / union_vec) * 100)
+)
+
+# 清理内存
+rm(shared_mat, pair_idx, shared_vec, union_vec, richness1_vec, richness2_vec, richness_vec)
+gc()
+
+# 检查结果
+head(share_df)
+summary(share_df$ASV_share_rate)
+
+nrow(share_df)
+choose(total_sample, 2)
+
+# 全局配色完全沿用之前设定
+family.color <- brewer.pal(10, "Set3")
+names(family.color) <- c("Between", "Within", "Father_offspring", "Mother_offspring", 
+                         "Spouse", "Sibling", "Grandparent_grandchild", "Nephew", "Roommate", "Other")
+# 1. 匹配家庭 Metadata (使用 case_when 保证稳健性)
+# =========================================================
+share_long <- share_df %>%
+  left_join(gut.16s.meta %>% select(ID2, Family1 = Family), by = c("Sample1" = "ID2")) %>%
+  left_join(gut.16s.meta %>% select(ID2, Family2 = Family), by = c("Sample2" = "ID2")) %>%
+  mutate(
+    Family = case_when(
+      is.na(Family1) | is.na(Family2) ~ NA_character_,
+      Family1 == Family2 ~ "Within",
+      TRUE ~ "Between"
+    )
+  )
+
+# 稳健性检查 (确保 Family1/Family2/Family 的缺失数全为 0)
+check_missing <- share_long %>%
+  summarise(
+    Family1_missing = sum(is.na(Family1)),
+    Family2_missing = sum(is.na(Family2)),
+    Family_missing  = sum(is.na(Family))
+  )
+cat("--- Metadata 匹配缺失率检查 --- \n")
+print(check_missing)
+
+# =========================================================
+# 2. 提取组间 (Between-family)
+# =========================================================
+share_between <- share_long %>%
+  filter(Family == "Between") %>%
+  mutate(Group = "Between-family") %>%
+  select(ASV_share_rate, Group)
+
+# =========================================================
+# 3. 提取全量组内 (Within-family) 并匹配亲属关系
+# =========================================================
+# A. 提取完整的同家庭汇总组 (完整定义，非仅 5 类亲属)
+within_all <- share_long %>%
+  filter(Family == "Within") %>%
+  transmute(ASV_share_rate = ASV_share_rate, Group = "Within-family")
+
+# B. 读取并建立亲属对照字典
+membership <- read_xlsx("Input/Membership.xlsx")
+membership$Group1[is.na(membership$Group1)] <- "Other"
+membership$Group2[is.na(membership$Group2)] <- "Other"
+
+membership_all <- bind_rows(
+  membership %>% select(Membership1, Membership2, Group1) %>% rename(M1 = Membership1, M2 = Membership2, Group = Group1),
+  membership %>% select(Membership2, Membership1, Group2) %>% rename(M1 = Membership2, M2 = Membership1, Group = Group2)
+) %>% distinct(M1, M2, .keep_all = TRUE)
+
+# C. 家庭内部配对详细保留 (保留 Sample1/2, Shared_ASV 等列，供后续年龄分层使用)
+share_within <- share_long %>%
+  filter(Family == "Within") %>%
+  left_join(gut.16s.meta %>% select(ID2, M1 = Membership), by = c("Sample1" = "ID2")) %>%
+  left_join(gut.16s.meta %>% select(ID2, M2 = Membership), by = c("Sample2" = "ID2")) %>%
+  left_join(membership_all, by = c("M1", "M2")) %>%
+  mutate(
+    Group = case_when(
+      Group == "Spouse" ~ "Spouse",
+      Group == "Mother_offspring" ~ "Mother-offspring",
+      Group == "Father_offspring" ~ "Father-offspring",
+      Group == "Sibling" ~ "Sibling",
+      Group == "Grandparent_grandchild" ~ "Grandparent-grandchild",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(Group))
+
+# =========================================================
+# 4. 构建统一绘图数据框
+# =========================================================
+group_levels <- c("Between-family", "Within-family", "Spouse", "Mother-offspring", "Father-offspring", "Sibling", "Grandparent-grandchild")
+
+plot_share_df <- bind_rows(
+  share_between,
+  within_all,
+  share_within %>% select(ASV_share_rate, Group)
+) %>%
+  mutate(Group = factor(Group, levels = group_levels))
+
+# 统计各组样本量 n 并构建 X 轴映射
+group_n <- plot_share_df %>% count(Group) %>% mutate(label = paste0(Group, "\n(n=", n, ")"))
+label_map <- set_names(group_n$label, group_n$Group)
+
+# 打印样本量统计表供检查
+print(group_n)
+
+# ======================
+# 两两比较组合 完全照搬Bray距离的对比列表
+comp_list <- list(c("Between-family", "Within-family"),
+  # 2~11：后面5类亲属全部两两对比
+  c("Spouse", "Mother-offspring"),
+  c("Spouse", "Father-offspring"),
+  c("Spouse", "Sibling"),
+  c("Spouse", "Grandparent-grandchild"),
+  c("Mother-offspring", "Father-offspring"),
+  c("Mother-offspring", "Sibling"),
+  c("Mother-offspring", "Grandparent-grandchild"),
+  c("Father-offspring", "Sibling"),
+  c("Father-offspring", "Grandparent-grandchild"),
+  c("Sibling", "Grandparent-grandchild"))
+
+#后面自己把不显著的去掉
+comp_list <- list(c("Between-family", "Within-family"),
+    c("Spouse", "Sibling"),c("Mother-offspring", "Father-offspring"),
+    c("Father-offspring", "Sibling"),
+    c("Father-offspring", "Grandparent-grandchild"))
+
+# ======================
+# 绘图：线条粗细、箱体宽度、透明度、尺寸全部和Bray图一模一样
+ggplot(plot_share_df, aes(x = Group, y = ASV_share_rate, fill = Group)) +
+    geom_boxplot(width = 0.5, outlier.size = 1, linewidth = 0.3) +
+    geom_signif(comparisons = comp_list,
+        test = "wilcox.test",
+        map_signif_level = TRUE,
+        step_increase = 0.12,
+        textsize = 3.2) + scale_fill_brewer(palette = "Set3") +
+    scale_x_discrete(labels = label_map) + # 【已修正】：严格匹配 label_map
+    labs(y = "ASV-level Jaccard similarity (%)", x = "") +
+    theme_bw() +theme( panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 10, color = "black"),
+        axis.text.y = element_text(size = 10, color = "black"),
+        legend.position = "none")
+		
+ggsave("gut-ASV-sharing-2.pdf",width =4.5,height = 5.5)
+
+#母子父子同胞的ASV共享
+
+# =========================================================
+# 1. 匹配家庭 Metadata 与 身份/年龄信息
+# =========================================================
+share_long <- share_df %>%
+  left_join(gut.16s.meta %>% select(ID2, Family1 = Family), by = c("Sample1" = "ID2")) %>%
+  left_join(gut.16s.meta %>% select(ID2, Family2 = Family), by = c("Sample2" = "ID2")) %>%
+  mutate(
+    Family = case_when(
+      is.na(Family1) | is.na(Family2) ~ NA_character_,
+      Family1 == Family2 ~ "Within",
+      TRUE ~ "Between"
+    )
+  )
+
+# 提取组内配对并匹配身份/年龄 (直接在 select 中重命名，更稳健)
+within_share <- share_long %>%
+  filter(Family == "Within") %>%
+  left_join(gut.16s.meta %>% select(ID2, M1 = Membership, Age1 = Age2), by = c("Sample1" = "ID2")) %>%
+  left_join(gut.16s.meta %>% select(ID2, M2 = Membership, Age2 = Age2), by = c("Sample2" = "ID2"))
+
+# 读取亲属对照表
+membership <- read_xlsx("Input/Membership.xlsx")
+membership$Group1[is.na(membership$Group1)] <- "Other"
+membership$Group2[is.na(membership$Group2)] <- "Other"
+
+mem_all <- bind_rows(
+  membership %>% select(Membership1, Membership2, Group1) %>% rename(m1 = Membership1, m2 = Membership2, PairType = Group1),
+  membership %>% select(Membership2, Membership1, Group2) %>% rename(m1 = Membership2, m2 = Membership1, PairType = Group2)
+) %>% distinct(m1, m2, .keep_all = TRUE)
+
+within_share <- within_share %>%
+  left_join(mem_all, by = c("M1" = "m1", "M2" = "m2")) %>%
+  filter(PairType %in% c("Mother_offspring", "Father_offspring", "Sibling"))
+
+# =========================================================
+# 2. 严格年龄判定函数 (防止 NA 误判为 Grown-up)
+# =========================================================
+get_pair_age_group <- function(pair_type, m1_typ, m2_typ, a1, a2) {
+  if (is.na(pair_type) | is.na(m1_typ) | is.na(m2_typ)) return(NA_character_)
+  
+  if (pair_type %in% c("Mother_offspring", "Father_offspring")) {
+    child_age <- if (m1_typ %in% c("m", "f")) a2 else if (m2_typ %in% c("m", "f")) a1 else NA_character_
+    if (is.na(child_age)) return(NA_character_)
+    if (child_age == "children") return("Underage")
+    if (child_age == "adult") return("Grown-up")
+    return(NA_character_)
+  }
+  
+  if (pair_type == "Sibling") {
+    if (is.na(a1) | is.na(a2)) return(NA_character_)
+    if (a1 == "children" & a2 == "children") return("Underage")
+    if (a1 == "adult" & a2 == "adult") return("Grown-up")
+    return(NA_character_)
+  }
+  return(NA_character_)
+}
+
+# 应用年龄清洗
+within_share_clean <- within_share %>%
+  rowwise() %>%
+  mutate(Age_Group = get_pair_age_group(PairType, M1, M2, Age1, Age2)) %>%
+  ungroup() %>%
+  filter(!is.na(Age_Group)) %>%
+  mutate(Age_Group = factor(Age_Group, levels = c("Underage", "Grown-up")))
+
+col_two <- c("Underage" = "#A2D9B1", "Grown-up" = "#C7B7E5")
+
+# 拆分数据集
+mom_share_data     <- within_share_clean %>% filter(PairType == "Mother_offspring")
+dad_share_data     <- within_share_clean %>% filter(PairType == "Father_offspring")
+sibling_share_data <- within_share_clean %>% filter(PairType == "Sibling")
+
+# =========================================================
+# 3. 绘制三张年龄分层小提琴图
+# =========================================================
+plot_age_violin <- function(df_data, title_text, filename) {
+  p <- ggplot(df_data, aes(x = Age_Group, y = ASV_share_rate, fill = Age_Group)) +
+    geom_violin(width = 0.7, alpha = 1, color = "#333333", linewidth = 0.4) +
+    geom_boxplot(width = 0.2, outlier.size = 0.8, linewidth = 0.4, color = "#333333") +
+    geom_signif(
+      comparisons = list(c("Underage", "Grown-up")),
+      test = "wilcox.test",
+      map_signif_level = TRUE,
+      step_increase = 0.1,
+      textsize = 3.5,
+      tip_length = 0.02
+    ) +
+    scale_fill_manual(values = col_two) +
+    labs(title = title_text, y = "ASV-level Jaccard similarity (%)", x = NULL) +
+    theme_bw() +
+    theme(
+      panel.grid = element_blank(),
+      plot.title = element_text(hjust = 0.5, size = 12, color = "black", face = "bold"),
+      axis.text.x = element_text(size = 10, color = "#444444"),
+      axis.text.y = element_text(size = 10, color = "#444444"),
+      axis.title.y = element_text(size = 11, color = "black"),
+      legend.position = "none"
+    )
+  
+  ggsave(filename, plot = p, width = 4, height = 5)
+  return(p)
+}
+
+plot_age_violin(mom_share_data, "Mother–offspring", "mother_ASV_share_gut.pdf")
+plot_age_violin(dad_share_data, "Father–offspring", "father_ASV_share_gut.pdf")
+plot_age_violin(sibling_share_data, "Sibling", "sibling_ASV_share_gut.pdf")
+#直接出图
+
+#肠道母子和父子ASV共享的相关性
+# 1. 严格提炼 Parent-Child 对应关系
+# =========================================================
+get_child_id <- function(s1, s2, m1, m2) {
+    if (m1 %in% c("m", "f") & !(m2 %in% c("m", "f"))) return(s2)
+    if (m2 %in% c("m", "f") & !(m1 %in% c("m", "f"))) return(s1)
+    return(NA_character_)
+}
+
+# 母子配对提炼
+mom_df <- within_share %>%
+    filter(PairType == "Mother_offspring") %>%
+    rowwise() %>%
+    mutate(Child_ID = get_child_id(Sample1, Sample2, M1, M2)) %>%
+    ungroup() %>%
+    filter(!is.na(Child_ID)) %>%
+    select(Family = Family1, Child_ID, Mother_rate = ASV_share_rate)
+
+# 父子配对提炼
+dad_df <- within_share %>%
+    filter(PairType == "Father_offspring") %>%
+    rowwise() %>%
+    mutate(Child_ID = get_child_id(Sample1, Sample2, M1, M2)) %>%
+    ungroup() %>%
+    filter(!is.na(Child_ID)) %>%
+    select(Family = Family1, Child_ID, Father_rate = ASV_share_rate)
+
+# 按家庭与孩子 ID 双重对齐合并
+plot_scatter_df <- inner_join(mom_df, dad_df, by = c("Family", "Child_ID")) %>%
+    mutate(Avg_rate = (Mother_rate + Father_rate) / 2)
+
+# 确定坐标轴最大上界 (按 5 的倍数向上取整，避免数据被截断)
+axis_max <- ceiling(max(c(plot_scatter_df$Father_rate, plot_scatter_df$Mother_rate), na.rm = TRUE) / 5) * 5
+
+# =========================================================
+# 2. 计算 Spearman 相关系数与作图
+# =========================================================
+cor_res  <- cor.test(plot_scatter_df$Father_rate, plot_scatter_df$Mother_rate, method = "spearman", exact = FALSE, use = "complete.obs")
+r_val    <- round(unname(cor_res$estimate), 2)
+p_val    <- formatC(cor_res$p.value, format = "e", digits = 2)
+ann_text <- paste0("R = ", r_val, "\nP = ", p_val)
+ggplot(plot_scatter_df, aes(x = Father_rate, y = Mother_rate)) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "black", linewidth = 0.6) +
+    geom_smooth(method = "lm", formula = y ~ x, color = "#1e88e5", fill = "gray80", alpha = 0.5, linewidth = 0.8) +
+    geom_point(aes(color = Avg_rate), size = 2.2, alpha = 0.7) +
+    scale_color_gradient(low = "#e0e0e0", high = "#212121", name = "ASV similarity (%)") +
+    coord_cartesian(xlim = c(0, axis_max), ylim = c(0, axis_max)) +
+    annotate("text", x = axis_max * 0.05, y = axis_max * 0.12, label = ann_text, hjust = 0, size = 3.5, fontface = "italic") +
+    labs(title = "Gut",
+        x = "Father–offspring ASV similarity (%)",
+        y = "Mother–offspring ASV similarity (%)"
+    ) +theme_bw() +theme( panel.grid = element_blank(),
+        plot.title = element_text(hjust = 0.5, size = 13, face = "bold"),
+        axis.text = element_text(size = 10, color = "black"),
+        axis.title = element_text(size = 11, color = "black"),
+        legend.title = element_text(size = 9),
+        legend.text = element_text(size = 8))
+ggsave("Gut_Father_vs_Mother_ASV_sharing.pdf", width = 5.2, height = 4.5)
+
+#口腔ASV共享
+# =========================================================
+# 1. 读取口腔 ASV 原始丰度表 (Saliva)
+# =========================================================
+# 行 = ASV，列 = 样本
+asv_raw_oral <- read.delim("Input/Saliva_16S_dada2_asv_table-1664.tsv",sep = "\t",row.names = 1,check.names = FALSE)
+
+# 确认所有样本列都是数值
+stopifnot(all(vapply(asv_raw_oral, is.numeric, logical(1))))
+
+cat("口腔原始 ASV 数量：", nrow(asv_raw_oral), "\n")
+cat("口腔原始样本数量：", ncol(asv_raw_oral), "\n")
+
+# =========================================================
+# 2. 严格二值化过滤 (Min 2 reads, Min 2 samples)
+# =========================================================
+# 规则：单个样本中 count >= 2 才视为有效检出
+asv_bin_all_oral <- t(as.matrix(asv_raw_oral)) >= 2
+
+# 保留在至少 2 个样本中达到 count >= 2 的 ASV (剔除 Singletons/Doubletons 噪声)
+keep_asv_oral <- colSums(asv_bin_all_oral) >= 2
+asv_clean_oral <- asv_raw_oral[keep_asv_oral, , drop = FALSE]
+
+cat("过滤后保留的口腔 ASV 数量：", nrow(asv_clean_oral), "\n")
+
+# 保存过滤后的口腔 ASV 表 (备用)
+write.table( asv_clean_oral,file = "Output/oral_ASV_filter_counts_min2reads_min2samples.txt",sep = "\t",quote = FALSE,col.names = NA)
+
+# =========================================================
+# 3. 极速矩阵乘法计算口腔两两 ASV 共享 (tcrossprod)
+# =========================================================
+# 最终二值逻辑矩阵：行 = 样本，列 = ASV
+asv_bin_oral   <- t(as.matrix(asv_clean_oral)) >= 2
+sample_vec_oral <- rownames(asv_bin_oral)
+total_sample_oral <- nrow(asv_bin_oral)
+
+cat("进入口腔共享分析的样本数量：", total_sample_oral, "\n")
+cat("理论配对数量：", choose(total_sample_oral, 2), "\n")
+
+# 计算各样本 Richness
+richness_vec_oral <- rowSums(asv_bin_oral)
+
+# 创建空的 N x N 共享矩阵
+shared_mat_oral <- matrix(
+  0, 
+  nrow = total_sample_oral, 
+  ncol = total_sample_oral, 
+  dimnames = list(sample_vec_oral, sample_vec_oral)
+)
+
+# 分块计算 (每次 500 条 ASV，省内存且调用底层 BLAS 矩阵乘法极速运算)
+block_size <- 500L
+start_vec  <- seq.int(from = 1L, to = ncol(asv_bin_oral), by = block_size)
+
+for (start_col in start_vec) {
+  end_col <- min(start_col + block_size - 1L, ncol(asv_bin_oral))
+  
+  # 提取小块并转为 double 类型
+  block <- asv_bin_oral[, start_col:end_col, drop = FALSE]
+  storage.mode(block) <- "double"
+  
+  # 矩阵乘法累加交集: Block %*% t(Block)
+  shared_mat_oral <- shared_mat_oral + tcrossprod(block)
+  
+  rm(block)
+  gc(FALSE)
+}
+
+# =========================================================
+# 4. 提取上三角矩阵 (绝对无方向，A-B 仅保留 1 次) 并构建 share_df_oral
+# =========================================================
+pair_idx_oral      <- which(upper.tri(shared_mat_oral), arr.ind = TRUE)
+shared_vec_oral    <- shared_mat_oral[pair_idx_oral]
+richness1_vec_oral <- richness_vec_oral[pair_idx_oral[, 1]]
+richness2_vec_oral <- richness_vec_oral[pair_idx_oral[, 2]]
+
+# 容斥原理计算并集: Union = A + B - Intersect
+union_vec_oral     <- richness1_vec_oral + richness2_vec_oral - shared_vec_oral
+
+# 构建口腔最终结果表
+share_df_oral <- tibble(
+  Sample1        = sample_vec_oral[pair_idx_oral[, 1]],
+  Sample2        = sample_vec_oral[pair_idx_oral[, 2]],
+  Richness1      = as.integer(richness1_vec_oral),
+  Richness2      = as.integer(richness2_vec_oral),
+  Shared_ASV     = as.integer(shared_vec_oral),
+  Union_ASV      = as.integer(union_vec_oral),
+  ASV_share_rate = ifelse(union_vec_oral == 0, NA_real_, (shared_vec_oral / union_vec_oral) * 100)
+)
+
+# 清理无用大对象，释放内存
+rm(asv_raw_oral, asv_bin_all_oral, asv_clean_oral, asv_bin_oral, 
+   shared_mat_oral, pair_idx_oral, shared_vec_oral, union_vec_oral, 
+   richness1_vec_oral, richness2_vec_oral, richness_vec_oral)
+gc()
+
+# =========================================================
+# 5. 检查计算结果
+# =========================================================
+cat("--- 口腔 ASV 共享率计算完成 --- \n")
+cat("共计算配对数：", nrow(share_df_oral), "\n")
+head(share_df_oral)
+summary(share_df_oral$ASV_share_rate)
+
+#保存共享表
+write.table(share_df_oral,file = "Output/oral-ASV_share_rate_all_pairs_min2reads.txt",sep = "\t", row.names = FALSE,quote = FALSE)
+saveRDS( share_df_oral,file ="Output/oral_share_df_ASV_min2reads_result.rds")
+
+#接下来准备画图
+share_long_oral <- share_df_oral %>%
+  left_join(oral.16s.meta %>% select(ID2, Family1 = Family), by = c("Sample1" = "ID2")) %>%
+  left_join(oral.16s.meta %>% select(ID2, Family2 = Family), by = c("Sample2" = "ID2")) %>%
+  mutate(
+    Family = case_when(
+      is.na(Family1) | is.na(Family2) ~ NA_character_,
+      Family1 == Family2 ~ "Within",
+      TRUE ~ "Between"
+    )
+  )
+
+# 稳健性检查
+check_missing_oral <- share_long_oral %>%
+  summarise(
+    Family1_missing = sum(is.na(Family1)),
+    Family2_missing = sum(is.na(Family2)),
+    Family_missing  = sum(is.na(Family))
+  )
+cat("--- 口腔 Metadata 匹配缺失率检查 --- \n")
+print(check_missing_oral)
+
+# 2. 提取跨家庭 (Between-family)
+share_between_oral <- share_long_oral %>%
+  filter(Family == "Between") %>%
+  mutate(Group = "Between-family") %>%
+  select(ASV_share_rate, Group)
+
+# 3. 提取全量组内 (Within-family) 并匹配亲属关系
+within_all_oral <- share_long_oral %>%
+  filter(Family == "Within") %>%
+  transmute(ASV_share_rate = ASV_share_rate, Group = "Within-family")
+
+# 读取亲属对照字典 (若前面已加载可直接复用，这里再次确保一致)
+membership <- read_xlsx("Input/Membership.xlsx")
+membership$Group1[is.na(membership$Group1)] <- "Other"
+membership$Group2[is.na(membership$Group2)] <- "Other"
+
+membership_all <- bind_rows(
+  membership %>% select(Membership1, Membership2, Group1) %>% rename(M1 = Membership1, M2 = Membership2, Group = Group1),
+  membership %>% select(Membership2, Membership1, Group2) %>% rename(M1 = Membership2, M2 = Membership1, Group = Group2)
+) %>% distinct(M1, M2, .keep_all = TRUE)
+
+share_within_oral <- share_long_oral %>%
+  filter(Family == "Within") %>%
+  left_join(oral.16s.meta %>% select(ID2, M1 = Membership), by = c("Sample1" = "ID2")) %>%
+  left_join(oral.16s.meta %>% select(ID2, M2 = Membership), by = c("Sample2" = "ID2")) %>%
+  left_join(membership_all, by = c("M1", "M2")) %>%
+  mutate(
+    Group = case_when(
+      Group == "Spouse" ~ "Spouse",
+      Group == "Mother_offspring" ~ "Mother-offspring",
+      Group == "Father_offspring" ~ "Father-offspring",
+      Group == "Sibling" ~ "Sibling",
+      Group == "Grandparent_grandchild" ~ "Grandparent-grandchild",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(Group))
+
+# 4. 构建统一绘图数据框
+group_levels <- c("Between-family", "Within-family", "Spouse", "Mother-offspring", "Father-offspring", "Sibling", "Grandparent-grandchild")
+
+plot_share_df_oral <- bind_rows(
+  share_between_oral,
+  within_all_oral,
+  share_within_oral %>% select(ASV_share_rate, Group)
+) %>%
+  mutate(Group = factor(Group, levels = group_levels))
+
+# 统计样本量并构建 X 轴映射
+group_n_oral <- plot_share_df_oral %>% count(Group) %>% mutate(label = paste0(Group, "\n(n=", n, ")"))
+label_map_oral <- set_names(group_n_oral$label, group_n_oral$Group)
+
+cat("--- 口腔家庭分组样本量统计 --- \n")
+print(group_n_oral)
+
+comp_list_oral <- list(
+    # 1. 组间vs组内
+    c("Between-family", "Within-family"),
+    # 2~11：后面5类亲属全部两两对比
+    c("Spouse", "Mother-offspring"),
+    c("Spouse", "Father-offspring"),
+    c("Spouse", "Sibling"),
+    c("Spouse", "Grandparent-grandchild"),
+    c("Mother-offspring", "Father-offspring"),
+    c("Mother-offspring", "Sibling"),
+    c("Mother-offspring", "Grandparent-grandchild"),
+    c("Father-offspring", "Sibling"),
+    c("Father-offspring", "Grandparent-grandchild"),
+    c("Sibling", "Grandparent-grandchild"))
+	
+comp_list_oral <- list(c("Between-family", "Within-family"),
+    c("Spouse", "Father-offspring"),
+    c("Spouse", "Sibling"),
+    c("Spouse", "Grandparent-grandchild"),
+    c("Mother-offspring", "Father-offspring"),
+    c("Mother-offspring", "Sibling"),
+    c("Mother-offspring", "Grandparent-grandchild"),
+    c("Father-offspring", "Sibling"),
+    c("Sibling", "Grandparent-grandchild"))
+
+ggplot(plot_share_df_oral, aes(x = Group, y = ASV_share_rate, fill = Group)) +
+    geom_boxplot(width = 0.5, outlier.size = 1, linewidth = 0.3) +
+    geom_signif(comparisons = comp_list_oral,
+        test = "wilcox.test",
+        map_signif_level = TRUE,
+        step_increase = 0.12,
+        textsize = 3.2) +scale_fill_brewer(palette = "Set3") +
+    scale_x_discrete(labels = label_map_oral) +
+    labs(y = "ASV-level Jaccard similarity (%)", x = "") +
+    theme_bw() +theme( panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 10, color = "black"),
+        axis.text.y = element_text(size = 10, color = "black"),
+        legend.position = "none")
+ ggsave("oral-ASV-sharing-2.pdf",width =4.5,height =5.5)
+ 
+ # 第二部分：口腔母子 / 父子 / 同胞 ASV 共享率年龄分层分析
+# =========================================================
+
+# 1. 匹配年龄列 (使用 oral.16s.meta 中的 Age2)
+within_share_oral_age <- share_long_oral %>%
+  filter(Family == "Within") %>%
+  left_join(oral.16s.meta %>% select(ID2, M1 = Membership, Age1 = Age2), by = c("Sample1" = "ID2")) %>%
+  left_join(oral.16s.meta %>% select(ID2, M2 = Membership, Age2 = Age2), by = c("Sample2" = "ID2")) %>%
+  left_join(
+    bind_rows(
+      membership %>% select(Membership1, Membership2, Group1) %>% rename(m1 = Membership1, m2 = Membership2, PairType = Group1),
+      membership %>% select(Membership2, Membership1, Group2) %>% rename(m1 = Membership2, m2 = Membership1, PairType = Group2)
+    ) %>% distinct(m1, m2, .keep_all = TRUE),
+    by = c("M1" = "m1", "M2" = "m2")
+  ) %>%
+  filter(PairType %in% c("Mother_offspring", "Father_offspring", "Sibling"))
+
+# 2. 严格年龄判定函数 (定义好的函数直接复用)
+get_pair_age_group <- function(pair_type, m1_typ, m2_typ, a1, a2) {
+  if (is.na(pair_type) | is.na(m1_typ) | is.na(m2_typ)) return(NA_character_)
+  
+  if (pair_type %in% c("Mother_offspring", "Father_offspring")) {
+    child_age <- if (m1_typ %in% c("m", "f")) a2 else if (m2_typ %in% c("m", "f")) a1 else NA_character_
+    if (is.na(child_age)) return(NA_character_)
+    if (child_age == "children") return("Underage")
+    if (child_age == "adult") return("Grown-up")
+    return(NA_character_)
+  }
+  
+  if (pair_type == "Sibling") {
+    if (is.na(a1) | is.na(a2)) return(NA_character_)
+    if (a1 == "children" & a2 == "children") return("Underage")
+    if (a1 == "adult" & a2 == "adult") return("Grown-up")
+    return(NA_character_)
+  }
+  return(NA_character_)
+}
+
+within_share_clean_oral <- within_share_oral_age %>%
+  rowwise() %>%
+  mutate(Age_Group = get_pair_age_group(PairType, M1, M2, Age1, Age2)) %>%
+  ungroup() %>%
+  filter(!is.na(Age_Group)) %>%
+  mutate(Age_Group = factor(Age_Group, levels = c("Underage", "Grown-up")))
+
+col_two <- c("Underage" = "#A2D9B1", "Grown-up" = "#C7B7E5")
+
+mom_share_data_oral     <- within_share_clean_oral %>% filter(PairType == "Mother_offspring")
+dad_share_data_oral     <- within_share_clean_oral %>% filter(PairType == "Father_offspring")
+sibling_share_data_oral <- within_share_clean_oral %>% filter(PairType == "Sibling")
+
+# 3. 绘制口腔三张小提琴图
+plot_age_violin_oral <- function(df_data, title_text, filename) {
+  p <- ggplot(df_data, aes(x = Age_Group, y = ASV_share_rate, fill = Age_Group)) +
+    geom_violin(width = 0.7, alpha = 1, color = "#333333", linewidth = 0.4) +
+    geom_boxplot(width = 0.2, outlier.size = 0.8, linewidth = 0.4, color = "#333333") +
+    geom_signif(
+      comparisons = list(c("Underage", "Grown-up")),
+      test = "wilcox.test",
+      map_signif_level = TRUE,
+      step_increase = 0.1,
+      textsize = 3.5,
+      tip_length = 0.02
+    ) +
+    scale_fill_manual(values = col_two) +
+    labs(title = title_text, y = "ASV-level Jaccard similarity (%)", x = NULL) +
+    theme_bw() +
+    theme(
+      panel.grid = element_blank(),
+      plot.title = element_text(hjust = 0.5, size = 12, color = "black", face = "bold"),
+      axis.text.x = element_text(size = 10, color = "#444444"),
+      axis.text.y = element_text(size = 10, color = "#444444"),
+      axis.title.y = element_text(size = 11, color = "black"),
+      legend.position = "none"
+    )
+  
+  ggsave(filename, plot = p, width = 4, height = 5)
+  return(p)
+}
+
+plot_age_violin_oral(mom_share_data_oral, "Mother–offspring", "mother_ASV_share_oral.pdf")
+plot_age_violin_oral(dad_share_data_oral, "Father–offspring", "father_ASV_share_oral.pdf")
+plot_age_violin_oral(sibling_share_data_oral, "Sibling", "sibling_ASV_share_oral.pdf")
+
+# 第三部分：口腔母子 vs 父子 ASV 共享率相关性散点图
+# =========================================================
+
+get_child_id <- function(s1, s2, m1, m2) {
+    if (m1 %in% c("m", "f") & !(m2 %in% c("m", "f"))) return(s2)
+    if (m2 %in% c("m", "f") & !(m1 %in% c("m", "f"))) return(s1)
+    return(NA_character_)
+}
+
+mom_df_oral <- within_share_oral_age %>%
+    filter(PairType == "Mother_offspring") %>%
+    rowwise() %>%
+    mutate(Child_ID = get_child_id(Sample1, Sample2, M1, M2)) %>%
+    ungroup() %>%
+    filter(!is.na(Child_ID)) %>%
+    select(Family = Family1, Child_ID, Mother_rate = ASV_share_rate)
+dad_df_oral <- within_share_oral_age %>%
+    filter(PairType == "Father_offspring") %>%
+    rowwise() %>%
+    mutate(Child_ID = get_child_id(Sample1, Sample2, M1, M2)) %>%
+    ungroup() %>%
+    filter(!is.na(Child_ID)) %>%
+    select(Family = Family1, Child_ID, Father_rate = ASV_share_rate)
+plot_scatter_df_oral <- inner_join(mom_df_oral, dad_df_oral, by = c("Family", "Child_ID")) %>%
+    mutate(Avg_rate = (Mother_rate + Father_rate) / 2)
+axis_max_oral <- ceiling(max(c(plot_scatter_df_oral$Father_rate, plot_scatter_df_oral$Mother_rate), na.rm = TRUE) / 5) * 5
+cor_res_oral  <- cor.test(plot_scatter_df_oral$Father_rate, plot_scatter_df_oral$Mother_rate, method = "spearman", exact = FALSE, use = "complete.obs")
+r_val_oral    <- round(unname(cor_res_oral$estimate), 2)
+p_val_oral    <- formatC(cor_res_oral$p.value, format = "e", digits = 2)
+ann_text_oral <- paste0("R = ", r_val_oral, "\nP = ", p_val_oral)
+ggplot(plot_scatter_df_oral, aes(x = Father_rate, y = Mother_rate)) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "black", linewidth = 0.6) +
+    geom_smooth(method = "lm", formula = y ~ x, color = "#1e88e5", fill = "gray80", alpha = 0.5, linewidth = 0.8) +
+    geom_point(aes(color = Avg_rate), size = 2.2, alpha = 0.7) +
+    scale_color_gradient(low = "#e0e0e0", high = "#212121", name = "ASV similarity (%)") +
+    coord_cartesian(xlim = c(0, axis_max_oral), ylim = c(0, axis_max_oral)) +
+    annotate("text", x = axis_max_oral * 0.05, y = axis_max_oral * 0.12, label = ann_text_oral, hjust = 0, size = 3.5, fontface = "italic") +
+    labs(title = "Saliva",
+        x = "Father–offspring ASV similarity (%)",
+        y = "Mother–offspring ASV similarity (%)"
+    ) +theme_bw() +theme( panel.grid = element_blank(),
+        plot.title = element_text(hjust = 0.5, size = 13, face = "bold"),
+        axis.text = element_text(size = 10, color = "black"),
+        axis.title = element_text(size = 11, color = "black"),
+        legend.title = element_text(size = 9),
+        legend.text = element_text(size = 8))
+
+ggsave("Oral_Father_vs_Mother_ASV_sharing.pdf", width = 5.2, height = 4.5)
+
+#2026 比较ASV共享率，口腔和粪便共享，这里肯定需要匹配样本
+library(tidyverse)
+library(readxl)
+library(ggpubr)
+library(ggsignif)
+
+# ==========================================
+# 步骤 1：构建 ID 映射字典，并获取【两边都有的个体交集】
+# ==========================================
+gut_id_map  <- set_names(gut.16s.meta$ID1, gut.16s.meta$ID2)
+oral_id_map <- set_names(oral.16s.meta$ID1, oral.16s.meta$ID2)
+
+# 1. 提取肠道和口腔各自包含的真实个体 ID1
+gut_individuals  <- unique(gut.16s.meta$ID1)
+oral_individuals <- unique(oral.16s.meta$ID1)
+
+# 2. 求交集：既有粪便又有唾液样本的重合个体 ID1
+common_individuals <- intersect(gut_individuals, oral_individuals)
+
+cat("==================================================\n")
+cat("【第一步：个体筛选结果】\n")
+cat("1. 肠道总个体数：", length(gut_individuals), "人\n")
+cat("2. 口腔总个体数：", length(oral_individuals), "人\n")
+cat("3. 既有粪便又有唾液的核心重合个体数：", length(common_individuals), "人\n")
+cat("==================================================\n\n")
+
+# 3. 准备亲属关系映射表 (mem_all)
+membership <- read_xlsx("Input/Membership.xlsx")
+membership$Group1[is.na(membership$Group1)] <- "Other"
+membership$Group2[is.na(membership$Group2)] <- "Other"
+
+mem_all <- bind_rows(
+  membership %>% select(Membership1, Membership2, Group1) %>% rename(m1 = Membership1, m2 = Membership2, Group = Group1),
+  membership %>% select(Membership2, Membership1, Group2) %>% rename(m1 = Membership2, m2 = Membership1, Group = Group2)
+) %>% distinct(m1, m2, .keep_all = TRUE)
+
+
+# ==========================================
+# 步骤 2：基于重合个体，分别提取肠道与口腔的家庭内部亲属配对
+# ==========================================
+
+# 1. 整理肠道数据（只保留Ind1和Ind2都在 common_individuals 里的行）
+gut_mapped <- share_df %>%
+  select(Sample1, Sample2, ASV_share_rate) %>%
+  mutate(
+    Ind1 = gut_id_map[as.character(Sample1)],
+    Ind2 = gut_id_map[as.character(Sample2)]
+  ) %>%
+  # 核心逻辑：只保留两个个体都在重合个体列表里的数据
+  filter(!is.na(Ind1) & !is.na(Ind2) & Ind1 != Ind2) %>%
+  filter(Ind1 %in% common_individuals & Ind2 %in% common_individuals) %>%
+  # 连接 Metadata
+  left_join(gut.16s.meta %>% select(ID1, Fam1 = Family, M1 = Membership), by = c("Ind1" = "ID1")) %>%
+  left_join(gut.16s.meta %>% select(ID1, Fam2 = Family, M2 = Membership), by = c("Ind2" = "ID1")) %>%
+  filter(Fam1 == Fam2) %>% # 只保留家庭内部
+  left_join(mem_all, by = c("M1" = "m1", "M2" = "m2")) %>%
+  mutate(
+    Pair_ID = paste(pmin(Ind1, Ind2), pmax(Ind1, Ind2), sep = "___"),
+    Group = case_when(
+      Group == "Spouse" ~ "Spouse",
+      Group == "Mother_offspring" ~ "Mother-offspring",
+      Group == "Father_offspring" ~ "Father-offspring",
+      Group == "Sibling" ~ "Sibling",
+      Group == "Grandparent_grandchild" ~ "Grandparent-grandchild",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(Group)) %>%
+  distinct(Pair_ID, .keep_all = TRUE) %>%
+  select(Pair_ID, Gut_Share = ASV_share_rate, Group)
+
+
+# 2. 整理口腔数据（同样只保留Ind1和Ind2都在 common_individuals 里的行）
+oral_mapped <- share_df_oral %>%
+  select(Sample1, Sample2, ASV_share_rate) %>%
+  mutate(
+    Ind1 = oral_id_map[as.character(Sample1)],
+    Ind2 = oral_id_map[as.character(Sample2)]
+  ) %>%
+  # 核心逻辑：只保留两个个体都在重合个体列表里的数据
+  filter(!is.na(Ind1) & !is.na(Ind2) & Ind1 != Ind2) %>%
+  filter(Ind1 %in% common_individuals & Ind2 %in% common_individuals) %>%
+  left_join(oral.16s.meta %>% select(ID1, Fam1 = Family, M1 = Membership), by = c("Ind1" = "ID1")) %>%
+  left_join(oral.16s.meta %>% select(ID1, Fam2 = Family, M2 = Membership), by = c("Ind2" = "ID1")) %>%
+  filter(Fam1 == Fam2) %>% # 只保留家庭内部
+  left_join(mem_all, by = c("M1" = "m1", "M2" = "m2")) %>%
+  mutate(
+    Pair_ID = paste(pmin(Ind1, Ind2), pmax(Ind1, Ind2), sep = "___"),
+    Group = case_when(
+      Group == "Spouse" ~ "Spouse",
+      Group == "Mother_offspring" ~ "Mother-offspring",
+      Group == "Father_offspring" ~ "Father-offspring",
+      Group == "Sibling" ~ "Sibling",
+      Group == "Grandparent_grandchild" ~ "Grandparent-grandchild",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(Group)) %>%
+  distinct(Pair_ID, .keep_all = TRUE) %>%
+  select(Pair_ID, Oral_Share = ASV_share_rate, Group)
+
+
+# ==========================================
+# 步骤 3：取 Pair_ID 取交集，合并成最终完全对齐的画图数据集，前面的交集可能会有误差，可能有的样本没有测序数据
+# ==========================================
+paired_df <- inner_join(oral_mapped, gut_mapped, by = c("Pair_ID", "Group"))
+
+# 转换成长表用于绘图
+paired_long <- paired_df %>%
+    pivot_longer(cols = c(Oral_Share, Gut_Share),names_to = "Site",values_to = "ASV_share_rate") %>%
+    mutate(Site = ifelse(Site == "Oral_Share", "Saliva", "Faeces"),
+        Site = factor(Site, levels = c("Saliva", "Faeces")),
+        Group = factor(Group, levels = c("Spouse", "Mother-offspring", "Father-offspring", "Sibling", "Grandparent-grandchild"))
+    ) %>%
+    filter(!is.na(Group)) %>% # 过滤掉不在上述 5 类中的异常 NA
+    arrange(Group, Pair_ID, Site)
+# 配色：薄荷绿 (Saliva) + 香草紫 (Faeces)
+col_site <- c("Saliva" = "#A2D9B1", "Faeces" = "#C7B7E5")
+
+# ==========================================
+# 步骤 4：绘图 1 —【家庭内部整体对比 (Within-family Overall)】
+# ==========================================
+p_val_main <- wilcox.test(ASV_share_rate ~ Site, data = paired_long, paired = TRUE)$p.value
+p_text_main <- ifelse(p_val_main < 0.001, "P < 0.001", paste0("P = ", formatC(p_val_main, format = "e", digits = 2)))
+
+ggplot(paired_long, aes(x = Site, y = ASV_share_rate, fill = Site)) +
+  geom_violin(width = 0.6, alpha = 0.7, color = "#333333", linewidth = 0.4, trim = FALSE) +
+  geom_boxplot(width = 0.18, alpha = 0.8, outlier.shape = NA, linewidth = 0.4, color = "#333333") +
+  geom_signif(
+    comparisons = list(c("Saliva", "Faeces")),
+    test = "wilcox.test",
+    test.args = list(paired = TRUE),
+    map_signif_level = TRUE,
+    y_position = 42,
+    textsize = 3.5,
+    tip_length = 0.02
+  ) +
+  annotate("text", x = 1.5, y = 47, label = p_text_main, fontface = "italic", size = 3.8) +
+  scale_fill_manual(values = col_site) +
+  coord_cartesian(ylim = c(-2, 50)) +
+  labs(title = "Strictly Matched Cohort (Within-family)", y = "ASV-sharing rate (%)", x = NULL) +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    panel.grid = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 11),
+    axis.text.x = element_text(angle = 45, hjust = 1, color = "black", size = 10),
+    axis.text.y = element_text(color = "black", size = 10)
+  )
+
+ggsave("Figure_Strictly_Matched_WithinFamily_Overall.pdf", width = 3.5, height = 4.8)
+
+# ==========================================
+# 步骤 5：绘图 2 —【5 种不同亲属关系细分对比】
+# ==========================================
+ggplot(paired_long, aes(x = Group, y = ASV_share_rate, fill = Site)) +
+  geom_boxplot(width = 0.5, outlier.size = 0.8, linewidth = 0.4, position = position_dodge(0.7)) +
+  scale_fill_manual(values = col_site) +
+  stat_compare_means(
+    aes(group = Site), 
+    label = "p.signif", 
+    method = "wilcox.test", 
+    paired = TRUE, # 成对 Wilcoxon 检验
+    label.y = 40
+  ) +
+  labs(title = "Strictly Matched Cohort (By Relationship)", y = "ASV-sharing rate (%)", x = NULL) +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 11),
+    axis.text.x = element_text(angle = 45, hjust = 1, color = "black", size = 10),
+    axis.text.y = element_text(color = "black", size = 10),
+    legend.title = element_blank(),
+    legend.position = "top"
+  )
+
+ggsave("Figure_Strictly_Matched_By_Relationship.pdf", width = 7.5, height = 5.0)
+
+#准备画全阴和全阳混合HP感染家庭的ASV共享情况
+# =========================================================
+gut_fam_hp <- gut.16s.meta %>%
+    filter(!is.na(Family) & !is.na(Hp) & Hp %in% c("Hp_P", "Hp_N")) %>%
+    group_by(Family) %>%
+    summarise(
+        n_total = n(),
+        n_pos   = sum(Hp == "Hp_P"),
+        n_neg   = sum(Hp == "Hp_N")
+    ) %>%
+    mutate(
+        Fam_Hp_Group = case_when(
+            n_pos == n_total ~ "Family-Mix-PP",
+            n_neg == n_total ~ "Family-Mix-NN",
+            n_pos > 0 & n_neg > 0 ~ "Family-Mix-PN",
+            TRUE ~ NA_character_
+        )
+    ) %>%
+    filter(!is.na(Fam_Hp_Group))
+
+cat("--- 肠道家庭 Hp 类型统计 --- \n")
+print(table(gut_fam_hp$Fam_Hp_Group))
+
+# =========================================================
+# 1.2 定义口腔家庭的 Hp 感染类型
+# =========================================================
+oral_fam_hp <- oral.16s.meta %>%
+    filter(!is.na(Family) & !is.na(Hp) & Hp %in% c("Hp_P", "Hp_N")) %>%
+    group_by(Family) %>%
+    summarise(
+        n_total = n(),
+        n_pos   = sum(Hp == "Hp_P"),
+        n_neg   = sum(Hp == "Hp_N")
+    ) %>%
+    mutate(
+        Fam_Hp_Group = case_when(
+            n_pos == n_total ~ "Family-Mix-PP",
+            n_neg == n_total ~ "Family-Mix-NN",
+            n_pos > 0 & n_neg > 0 ~ "Family-Mix-PN",
+            TRUE ~ NA_character_
+        )
+    ) %>%
+    filter(!is.na(Fam_Hp_Group))
+
+cat("\n--- 口腔家庭 Hp 类型统计 --- \n")
+print(table(oral_fam_hp$Fam_Hp_Group))
+
+library(tidyverse)
+library(readxl)
+library(ggpubr)
+
+# =========================================================
+# 1. 基础准备 (确保列名统一为 PairType)
+# =========================================================
+membership <- read_xlsx("Input/Membership.xlsx")
+membership$Group1[is.na(membership$Group1)] <- "Other"
+membership$Group2[is.na(membership$Group2)] <- "Other"
+
+mem_all <- bind_rows(
+  membership %>% select(Membership1, Membership2, Group1) %>% rename(m1 = Membership1, m2 = Membership2, PairType = Group1),
+  membership %>% select(Membership2, Membership1, Group2) %>% rename(m1 = Membership2, m2 = Membership1, PairType = Group2)
+) %>% distinct(m1, m2, .keep_all = TRUE)
+
+# 配色：PP (浅绿)、PN (浅紫)、NN (浅橙)
+col_hp_pair <- c("PP" = "#A2D9B1", "PN" = "#C7B7E5", "NN" = "#F8C48C")
+my_comparisons <- list(c("PP", "PN"), c("PP", "NN"), c("PN", "NN"))
+
+# =========================================================
+# 2. 核心处理与画图函数 (自动处理 Gut / Oral)
+# =========================================================
+process_rel_hp <- function(share_df_data, meta_data, tissue_name) {
+  
+  # A. 提取配对 + 匹配亲属关系 + 匹配双人 Hp 状态
+  paired_hp <- share_df_data %>%
+    left_join(meta_data %>% select(ID2, Fam1 = Family, M1 = Membership, Hp1 = Hp), by = c("Sample1" = "ID2")) %>%
+    left_join(meta_data %>% select(ID2, Fam2 = Family, M2 = Membership, Hp2 = Hp), by = c("Sample2" = "ID2")) %>%
+    filter(!is.na(Fam1) & !is.na(Fam2) & Fam1 == Fam2) %>%
+    left_join(mem_all, by = c("M1" = "m1", "M2" = "m2")) %>%
+    filter(PairType %in% c("Mother_offspring", "Father_offspring", "Sibling")) %>%
+    filter(!is.na(Hp1) & !is.na(Hp2) & Hp1 %in% c("Hp_P", "Hp_N") & Hp2 %in% c("Hp_P", "Hp_N")) %>%
+    mutate(
+      Hp_Pair_Group = case_when(
+        Hp1 == "Hp_P" & Hp2 == "Hp_P" ~ "PP",
+        Hp1 == "Hp_N" & Hp2 == "Hp_N" ~ "NN",
+        TRUE ~ "PN"
+      ),
+      Hp_Pair_Group = factor(Hp_Pair_Group, levels = c("PP", "PN", "NN")),
+      PairType = case_when(
+        PairType == "Mother_offspring" ~ "Mother–offspring",
+        PairType == "Father_offspring" ~ "Father–offspring",
+        PairType == "Sibling" ~ "Sibling"
+      ),
+      PairType = factor(PairType, levels = c("Mother–offspring", "Father–offspring", "Sibling"))
+    )
+  
+  # B. 统计各组配对样本量
+  cat(paste0("\n=== ", tissue_name, " 亲属配对样本量统计 ===\n"))
+  print(table(paired_hp$PairType, paired_hp$Hp_Pair_Group))
+  
+  # C. 循环绘制 3 张子图
+  plot_list <- list()
+  rel_types <- c("Mother–offspring", "Father–offspring", "Sibling")
+  
+  for (rel in rel_types) {
+    sub_df <- paired_hp %>% filter(PairType == rel)
+    
+    p <- ggplot(sub_df, aes(x = Hp_Pair_Group, y = ASV_share_rate, fill = Hp_Pair_Group, color = Hp_Pair_Group)) +
+      geom_violin(width = 0.6, alpha = 0.5, linewidth = 0.4, trim = TRUE) +
+      geom_boxplot(width = 0.15, alpha = 0.8, outlier.shape = NA, linewidth = 0.4, color = "#444444") +
+      stat_compare_means(
+        comparisons = my_comparisons,
+        method = "wilcox.test",
+        label = "p.signif",
+        step.increase = 0.08,
+        size = 3.5,
+        tip.length = 0.02
+      ) +
+      stat_compare_means(method = "kruskal.test", label.y = max(sub_df$ASV_share_rate, na.rm=TRUE) * 1.1) +
+      scale_fill_manual(values = col_hp_pair) +
+      scale_color_manual(values = col_hp_pair) +
+      labs(title = paste0(tissue_name, ": ", rel), y = "ASV-sharing rate (%)", x = NULL) +
+      theme_bw() +
+      theme(
+        panel.grid = element_blank(),
+        plot.title = element_text(hjust = 0.5, size = 11, face = "bold"),
+        axis.text.x = element_text(size = 10, color = "black"),
+        axis.text.y = element_text(size = 10, color = "black"),
+        legend.position = "none"
+      )
+    
+    plot_list[[rel]] <- p
+  }
+  
+  # D. 拼图并保存
+  p_combined <- ggarrange(plotlist = plot_list, ncol = 3, nrow = 1)
+  ggsave(paste0(tissue_name, "_ASV_sharing_by_Relationship_Hp.pdf"), plot = p_combined, width = 10.5, height = 4.2)
+  
+  return(p_combined)
+}
+
+# =========================================================
+# 3. 分别一键生成 Gut 和 Oral 图像
+# =========================================================
+p_gut_rel  <- process_rel_hp(share_df, gut.16s.meta, "Gut")
+p_oral_rel <- process_rel_hp(share_df_oral, oral.16s.meta, "Oral")
+
+
+  
+#整合在一起，直接基于前面算好的共享率进行赋值
+gut_share_df  <- readRDS("Output/gut_share_df_ASV_min2reads_result.rds")
+oral_share_df <- readRDS("Output/oral_share_df_ASV_min2reads_result.rds")
+
+# =========================================================
+# 步骤 2：封装通用的数据清洗与年龄分层函数
+# =========================================================
+get_pair_age_group <- function(pair_type, m1_typ, m2_typ, a1, a2) {
+    if (is.na(pair_type) | is.na(m1_typ) | is.na(m2_typ)) return(NA_character_)
+    
+    if (pair_type %in% c("Mother_offspring", "Father_offspring")) {
+        child_age <- if (m1_typ %in% c("m", "f")) a2 else if (m2_typ %in% c("m", "f")) a1 else NA_character_
+        if (is.na(child_age)) return(NA_character_)
+        if (child_age == "children") return("Underage")
+        if (child_age == "adult") return("Grown-up")
+        return(NA_character_)
+    }
+    
+    if (pair_type == "Sibling") {
+        if (is.na(a1) | is.na(a2)) return(NA_character_)
+        if (a1 == "children" & a2 == "children") return("Underage")
+        if (a1 == "adult" & a2 == "adult") return("Grown-up")
+        return(NA_character_)
+    }
+    return(NA_character_)
+}
+
+prepare_asv_plot_data <- function(share_df, meta_df, membership_excel) {
+    # 匹配家庭信息
+    share_long <- share_df %>%
+        left_join(meta_df %>% select(ID2, Family1 = Family), by = c("Sample1" = "ID2")) %>%
+        left_join(meta_df %>% select(ID2, Family2 = Family), by = c("Sample2" = "ID2")) %>%
+        filter(!is.na(Family1) & !is.na(Family2) & Family1 == Family2) %>%
+        left_join(meta_df %>% select(ID2, M1 = Membership, Age1 = Age2), by = c("Sample1" = "ID2")) %>%
+        left_join(meta_df %>% select(ID2, M2 = Membership, Age2 = Age2), by = c("Sample2" = "ID2"))
+    
+    # 匹配亲属对照字典
+    membership <- read_xlsx(membership_excel)
+    membership$Group1[is.na(membership$Group1)] <- "Other"
+    membership$Group2[is.na(membership$Group2)] <- "Other"
+    
+    mem_all <- bind_rows(
+        membership %>% select(Membership1, Membership2, Group1) %>% rename(m1 = Membership1, m2 = Membership2, PairType = Group1),
+        membership %>% select(Membership2, Membership1, Group2) %>% rename(m1 = Membership2, m2 = Membership1, PairType = Group2)
+    ) %>% distinct(m1, m2, .keep_all = TRUE)
+    
+    # 标注亲属并判定年龄层级
+    plot_clean <- share_long %>%
+        left_join(mem_all, by = c("M1" = "m1", "M2" = "m2")) %>%
+        filter(PairType %in% c("Mother_offspring", "Father_offspring", "Sibling")) %>%
+        rowwise() %>%
+        mutate(Age_Group = get_pair_age_group(PairType, M1, M2, Age1, Age2)) %>%
+        ungroup() %>%
+        filter(!is.na(Age_Group)) %>%
+        mutate(
+            PairType = factor(PairType, 
+                              levels = c("Mother_offspring", "Father_offspring", "Sibling"),
+                              labels = c("Mother–offspring", "Father–offspring", "Sibling")),
+            Age_Group = factor(Age_Group, levels = c("Underage", "Grown-up"))
+        )
+    
+    return(plot_clean)
+}
+
+# 提取肠道与口腔分析数据
+gut_asv_plot_df  <- prepare_asv_plot_data(gut_share_df, gut.16s.meta, "Input/Membership.xlsx")
+oral_asv_plot_df <- prepare_asv_plot_data(oral_share_df, oral.16s.meta, "Input/Membership.xlsx")
+
+# =========================================================
+# 步骤 3：定义合三为一的高颜值分面绘图函数
+# =========================================================
+col_two <- c("Underage" = "#A2D9B1", "Grown-up" = "#C7B7E5")
+
+plot_merged_asv_violin <- function(data_df, y_title, file_name) {
+    p <- ggplot(data_df, aes(x = Age_Group, y = ASV_share_rate, fill = Age_Group)) +
+        # 小提琴图
+        geom_violin(width = 0.75, scale = "width", alpha = 0.85, linewidth = 0.25, color = "black") +
+        # 箱线图
+        geom_boxplot(width = 0.2, color = "black", alpha = 0.9, linewidth = 0.3, outlier.shape = NA) +
+        # 分面处理（三组亲属并排）
+        facet_wrap(~ PairType, nrow = 1) +
+        # 显著性横线
+        geom_signif(
+            comparisons = list(c("Underage", "Grown-up")),
+            test = "wilcox.test",
+            map_signif_level = TRUE,
+            step_increase = 0.05,
+            textsize = 3.5,
+            linewidth = 0.3,
+            tip_length = 0.02
+        ) +
+        scale_fill_manual(values = col_two) +
+        labs(x = NULL, y = y_title) +
+        theme_bw() +
+        theme(
+            panel.grid = element_blank(),
+            legend.position = "none",
+            # 分面顶部框样式
+            strip.background = element_rect(fill = "#F2F2F2", color = "black", linewidth = 0.3),
+            strip.text = element_text(size = 12, face = "bold", color = "black"),
+            # 坐标轴样式
+            axis.text.x = element_text(angle = 45, hjust = 1, size = 12, color = "black"),
+            axis.text.y = element_text(size = 12, color = "black"),
+            axis.title.y = element_text(size = 11, face = "plain"),
+            panel.spacing = unit(0.8, "lines")
+        )
+    
+    ggsave(file_name, plot = p, width = 6, height = 4)
+    return(p)
+}
+
+# =========================================================
+# 步骤 4：一键生成 Gut 和 Oral 的合图 PDF
+# =========================================================
+p_gut_asv  <- plot_merged_asv_violin(gut_asv_plot_df, "ASV-level Jaccard similarity (%)", "Merged_ASV_sharing_gut.pdf")
+p_oral_asv <- plot_merged_asv_violin(oral_asv_plot_df, "ASV-level Jaccard similarity (%)", "Merged_ASV_sharing_oral.pdf")
+
+
+
+#进一步基于不同亲子关系进行全阴全阳混合的比较
+library(tidyverse)
+library(ggpubr)
+library(clinfun)
+
+# ============================================================
+# Parent-offspring ASV sharing: NN / PN / PP
+# Parent + Mother + Father 三个panel
+# ============================================================
+
+col_hp <- c("NN" = "#F8C48C", "PN" = "#C7B7E5", "PP" = "#A2D9B1")
+pair_comparisons <- list(c("NN", "PN"), c("NN", "PP"), c("PN", "PP"))
+
+plot_parent_hp <- function(family_pairs, site_name) {
+    
+    # ----------------------------------------------------------
+    # 1. 构建三个分析panel
+    # ----------------------------------------------------------
+    parent_base <- family_pairs %>%
+        filter(Relationship %in% c("Mother–offspring", "Father–offspring")) %>%
+        mutate(Hp_Pair3 = factor(Hp_Pair3, levels = c("NN", "PN", "PP")))
+    
+    plot_df <- bind_rows(
+        parent_base %>% mutate(Panel = "Parent–offspring"),
+        parent_base %>% filter(Relationship == "Mother–offspring") %>% mutate(Panel = "Mother–offspring"),
+        parent_base %>% filter(Relationship == "Father–offspring") %>% mutate(Panel = "Father–offspring")
+    ) %>%
+        mutate(Panel = factor(Panel, levels = c("Parent–offspring", "Mother–offspring", "Father–offspring")),
+               Hp_Positive_N = case_when(Hp_Pair3 == "NN" ~ 0, Hp_Pair3 == "PN" ~ 1, Hp_Pair3 == "PP" ~ 2))
+    
+    # ----------------------------------------------------------
+    # 2. Print每组样本量
+    # ----------------------------------------------------------
+    cat("\n====================================================\n")
+    cat(site_name, ": sample size\n")
+    cat("====================================================\n")
+    print(plot_df %>% count(Panel, Hp_Pair3) %>% pivot_wider(names_from = Hp_Pair3, values_from = n, values_fill = 0))
+    
+    # ----------------------------------------------------------
+    # 3. Print每组中位数和IQR
+    # ----------------------------------------------------------
+    cat("\n", site_name, ": median and IQR\n", sep = "")
+    summary_df <- plot_df %>%
+        group_by(Panel, Hp_Pair3) %>%
+        summarise(n = n(), median = median(ASV_share_rate, na.rm = TRUE),
+                  Q1 = quantile(ASV_share_rate, 0.25, na.rm = TRUE),
+                  Q3 = quantile(ASV_share_rate, 0.75, na.rm = TRUE), .groups = "drop")
+    print(summary_df)
+    
+    # ----------------------------------------------------------
+    # 4. 两两Wilcoxon：NN vs PN / NN vs PP / PN vs PP
+    #    这里先报告raw P，不做多重校正
+    # ----------------------------------------------------------
+    pairwise_p <- plot_df %>%
+        group_by(Panel) %>%
+        group_modify(~{
+            map_dfr(pair_comparisons, function(cp) {
+                x <- .x %>% filter(Hp_Pair3 == cp[1]) %>% pull(ASV_share_rate)
+                y <- .x %>% filter(Hp_Pair3 == cp[2]) %>% pull(ASV_share_rate)
+                wt <- wilcox.test(x, y, exact = FALSE)
+                tibble(comparison = paste(cp[1], "vs", cp[2]), p_value = wt$p.value)
+            })
+        }) %>%
+        ungroup()
+    
+    cat("\n", site_name, ": pairwise Wilcoxon P values\n", sep = "")
+    print(pairwise_p)
+    
+    # ----------------------------------------------------------
+    # 5. Jonckheere-Terpstra趋势检验：NN < PN < PP
+    # ----------------------------------------------------------
+    trend_p <- plot_df %>%
+        group_by(Panel) %>%
+        group_modify(~{
+            jt <- suppressWarnings(jonckheere.test(.x$ASV_share_rate, .x$Hp_Positive_N, alternative = "increasing"))
+            tibble(P_trend = jt$p.value)
+        }) %>%
+        ungroup()
+    
+    cat("\n", site_name, ": Jonckheere-Terpstra P for trend\n", sep = "")
+    print(trend_p)
+    
+    # ----------------------------------------------------------
+    # 6. 为图上的P for trend准备位置
+    # ----------------------------------------------------------
+    trend_label <- plot_df %>%
+        group_by(Panel) %>%
+        summarise(y = max(ASV_share_rate, na.rm = TRUE) * 1.36, .groups = "drop") %>%
+        left_join(trend_p, by = "Panel") %>%
+        mutate(x = 2, label = paste0("P for trend = ", format.pval(P_trend, digits = 3, eps = 0.001)))
+    
+    # ----------------------------------------------------------
+    # 7. 作图
+    # ----------------------------------------------------------
+    p <- ggplot(plot_df, aes(x = Hp_Pair3, y = ASV_share_rate, fill = Hp_Pair3, color = Hp_Pair3)) +
+        geom_violin(width = 0.65, alpha = 0.60, linewidth = 0.4, trim = TRUE) +
+        geom_boxplot(width = 0.14, alpha = 0.85, outlier.shape = NA, linewidth = 0.4, color = "#444444") +
+        stat_compare_means(comparisons = pair_comparisons, method = "wilcox.test", label = "p.format") +
+        geom_text(data = trend_label, aes(x = x, y = y, label = label), inherit.aes = FALSE,
+                  size = 3.7, fontface = "bold") +
+        facet_wrap(~Panel, nrow = 1) +
+        scale_fill_manual(values = col_hp) +
+        scale_color_manual(values = col_hp) +
+        labs(title = site_name, x = NULL, y = "ASV-sharing rate (%)") +
+        theme_bw(base_size = 12) +
+        theme(panel.grid = element_blank(), legend.position = "none",
+              strip.text = element_text(size = 11, face = "bold"),
+              plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+              axis.text.x = element_text(size = 10, color = "black"),
+              axis.text.y = element_text(size = 10, color = "black"),
+              axis.title.y = element_text(size = 11, face = "bold"))
+    
+    return(list(plot = p, summary = summary_df, pairwise_p = pairwise_p, trend_p = trend_p, data = plot_df))
+}
+
+
+# ============================================================
+# 8. Gut
+# ============================================================
+gut_result <- plot_parent_hp(gut_family_pairs, "Gut microbiota")
+p_gut <- gut_result$plot
+p_gut
+
+
+# ============================================================
+# 9. Oral
+# ============================================================
+oral_result <- plot_parent_hp(oral_family_pairs, "Oral microbiota")
+p_oral <- oral_result$plot
+p_oral
+
+
+library(tidyverse)
+library(ggpubr)
+library(clinfun)
+
+# ============================================================
+# Shared ASV number: NN / PN / PP
+# Parent + Mother + Father 三个panel
+# ============================================================
+
+col_hp <- c("NN" = "#F8C48C", "PN" = "#C7B7E5", "PP" = "#A2D9B1")
+pair_comparisons <- list(c("NN", "PN"), c("NN", "PP"), c("PN", "PP"))
+
+plot_shared_asv <- function(family_pairs, site_name) {
+    
+    parent_base <- family_pairs %>%
+        filter(Relationship %in% c("Mother–offspring", "Father–offspring")) %>%
+        mutate(Hp_Pair3 = factor(Hp_Pair3, levels = c("NN", "PN", "PP")))
+    
+    plot_df <- bind_rows(
+        parent_base %>% mutate(Panel = "Parent–offspring"),
+        parent_base %>% filter(Relationship == "Mother–offspring") %>% mutate(Panel = "Mother–offspring"),
+        parent_base %>% filter(Relationship == "Father–offspring") %>% mutate(Panel = "Father–offspring")
+    ) %>%
+        mutate(
+            Panel = factor(Panel, levels = c("Parent–offspring", "Mother–offspring", "Father–offspring")),
+            Hp_Positive_N = case_when(Hp_Pair3 == "NN" ~ 0, Hp_Pair3 == "PN" ~ 1, Hp_Pair3 == "PP" ~ 2)
+        )
+    
+    # ==========================================================
+    # 统计结果
+    # ==========================================================
+    
+    summary_df <- plot_df %>%
+        group_by(Panel, Hp_Pair3) %>%
+        summarise(n = n(), median = median(Shared_ASV, na.rm = TRUE),
+                  Q1 = quantile(Shared_ASV, 0.25, na.rm = TRUE),
+                  Q3 = quantile(Shared_ASV, 0.75, na.rm = TRUE), .groups = "drop")
+    
+    kw_p <- plot_df %>%
+        group_by(Panel) %>%
+        group_modify(~{
+            tt <- kruskal.test(Shared_ASV ~ Hp_Pair3, data = .x)
+            tibble(KW_p = tt$p.value)
+        }) %>% ungroup()
+    
+    pairwise_p <- plot_df %>%
+        group_by(Panel) %>%
+        group_modify(~{
+            map_dfr(pair_comparisons, function(cp) {
+                x <- .x %>% filter(Hp_Pair3 == cp[1]) %>% pull(Shared_ASV)
+                y <- .x %>% filter(Hp_Pair3 == cp[2]) %>% pull(Shared_ASV)
+                wt <- wilcox.test(x, y, exact = FALSE)
+                tibble(comparison = paste(cp[1], "vs", cp[2]), p_value = wt$p.value)
+            })
+        }) %>% ungroup()
+    
+    trend_p <- plot_df %>%
+        group_by(Panel) %>%
+        group_modify(~{
+            jt <- suppressWarnings(jonckheere.test(.x$Shared_ASV, .x$Hp_Positive_N, alternative = "increasing"))
+            tibble(P_trend = jt$p.value)
+        }) %>% ungroup()
+    
+    cat("\n====================================================\n")
+    cat(site_name, ": Shared ASV number\n")
+    cat("====================================================\n\n")
+    print(summary_df)
+    cat("\nKruskal-Wallis P values:\n"); print(kw_p)
+    cat("\nPairwise Wilcoxon P values:\n"); print(pairwise_p)
+    cat("\nP for trend:\n"); print(trend_p)
+    
+    # ==========================================================
+    # P for trend位置
+    # ==========================================================
+    
+    trend_label <- plot_df %>%
+        group_by(Panel) %>%
+        summarise(y = max(Shared_ASV, na.rm = TRUE) * 1.34, .groups = "drop") %>%
+        left_join(trend_p, by = "Panel") %>%
+        mutate(x = 2, label = paste0("P for trend = ", format.pval(P_trend, digits = 3, eps = 0.001)))
+    
+    # ==========================================================
+    # 作图
+    # ==========================================================
+    
+    p <- ggplot(plot_df, aes(x = Hp_Pair3, y = Shared_ASV, fill = Hp_Pair3, color = Hp_Pair3)) +
+        geom_violin(width = 0.65, alpha = 0.60, linewidth = 0.4, trim = TRUE) +
+        geom_boxplot(width = 0.14, alpha = 0.85, outlier.shape = NA, linewidth = 0.4, color = "#444444") +
+        stat_compare_means(comparisons = pair_comparisons, method = "wilcox.test",
+                           label = "p.format", step.increase = 0.08, tip.length = 0.015, size = 3.5) +
+        geom_text(data = trend_label, aes(x = x, y = y, label = label),
+                  inherit.aes = FALSE, size = 3.7, fontface = "bold") +
+        facet_wrap(~Panel, nrow = 1) +
+        scale_fill_manual(values = col_hp) +
+        scale_color_manual(values = col_hp) +
+        labs(title = site_name, x = NULL, y = "Number of shared ASVs") +
+        theme_bw(base_size = 12) +
+        theme(panel.grid = element_blank(), legend.position = "none",
+              strip.text = element_text(size = 11, face = "bold"),
+              plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+              axis.text.x = element_text(size = 10, color = "black"),
+              axis.text.y = element_text(size = 10, color = "black"),
+              axis.title.y = element_text(size = 11, face = "bold"))
+    
+    return(list(plot = p, summary = summary_df, kw_p = kw_p,
+                pairwise_p = pairwise_p, trend_p = trend_p, data = plot_df))
+}
+
+#结果展示
+# ============================================================
+# Gut
+# ============================================================
+
+gut_shared_result <- plot_shared_asv(gut_family_pairs, "Gut microbiota")
+p_gut_shared <- gut_shared_result$plot
+p_gut_shared
+
+# ============================================================
+# Oral
+# ============================================================
+
+oral_shared_result <- plot_shared_asv(oral_family_pairs, "Oral microbiota")
+p_oral_shared <- oral_shared_result$plot
+p_oral_shared
+
+#比较分母
+check_union_asv <- function(family_pairs, site_name) {
+    
+    parent_base <- family_pairs %>%
+        filter(Relationship %in% c("Mother–offspring", "Father–offspring")) %>%
+        mutate(Hp_Pair3 = factor(Hp_Pair3, levels = c("NN", "PN", "PP")))
+    
+    dat <- bind_rows(
+        parent_base %>% mutate(Panel = "Parent–offspring"),
+        parent_base %>% filter(Relationship == "Mother–offspring") %>% mutate(Panel = "Mother–offspring"),
+        parent_base %>% filter(Relationship == "Father–offspring") %>% mutate(Panel = "Father–offspring")
+    )
+    
+    cat("\n================ ", site_name, ": Union ASV ================\n")
+    
+    print(
+        dat %>% group_by(Panel, Hp_Pair3) %>%
+            summarise(n = n(), median_union = median(Union_ASV, na.rm = TRUE),
+                      Q1 = quantile(Union_ASV, 0.25, na.rm = TRUE),
+                      Q3 = quantile(Union_ASV, 0.75, na.rm = TRUE), .groups = "drop")
+    )
+    
+    print(
+        dat %>% group_by(Panel) %>%
+            group_modify(~{
+                tt <- kruskal.test(Union_ASV ~ Hp_Pair3, data = .x)
+                tibble(KW_p = tt$p.value)
+            })
+    )
+}
+
+check_union_asv(gut_family_pairs, "Gut")
+check_union_asv(oral_family_pairs, "Oral")
+
+check_union_asv(gut_family_pairs, "Gut")
